@@ -157,6 +157,17 @@ class ArchiveTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     release.upload(path)
 
+    def test_draft_creation_uses_returned_id_without_tag_lookup(self):
+        release = app.Release("fixture/repo", "fixture-tag")
+        response = {"id": 123, "draft": True, "tag_name": "fixture-tag"}
+        with patch.dict(os.environ, {"GITHUB_SHA": "fixture"}), patch.object(app.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(response))) as command:
+            release.create("fixture release")
+            self.assertEqual(release.id, "123")
+            self.assertEqual(command.call_count, 1)
+            args, kwargs = command.call_args
+            self.assertEqual(args[0][:5], ["gh", "api", "--method", "POST", "repos/fixture/repo/releases"])
+            self.assertTrue(json.loads(kwargs["input"])["draft"])
+
     def test_aria2_failure_clears_sparse_file_before_curl(self):
         with tempfile.TemporaryDirectory() as temp:
             probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))

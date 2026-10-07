@@ -356,18 +356,25 @@ class Release:
                 return result.stdout
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
-        raise RuntimeError("GitHub Release操作失败；检查Actions权限和网络")
+        status = re.search(r"HTTP (\d{3})", result.stderr or "")
+        detail = f"HTTP {status.group(1)}" if status else f"exit {result.returncode}"
+        raise RuntimeError(f"GitHub {args[0]}操作失败：{detail}；检查权限和网络")
 
     def create(self, title):
         # Each run has a new tag. Do not reuse or overwrite an existing Release.
-        result = subprocess.run(["gh", "release", "create", self.tag, "--repo", self.repo,
-                                 "--target", os.environ["GITHUB_SHA"], "--draft", "--title", title,
-                                 "--notes", "归档正在生成；草稿可能不完整。"], capture_output=True, text=True)
+        payload = {"tag_name": self.tag, "target_commitish": os.environ["GITHUB_SHA"],
+                   "draft": True, "name": title, "body": "归档正在生成；草稿可能不完整。"}
+        result = subprocess.run(["gh", "api", "--method", "POST", f"repos/{self.repo}/releases", "--input", "-"],
+                                input=json.dumps(payload), capture_output=True, text=True)
         if result.returncode:
-            raise RuntimeError("创建Release草稿失败；未下载原文件")
-        self.id = self.command("api", f"repos/{self.repo}/releases/tags/{self.tag}", "--jq", ".id").strip()
-        if not self.id.isdigit():
-            raise RuntimeError("Release草稿ID无效")
+            status = re.search(r"HTTP (\d{3})", result.stderr or "")
+            detail = f"HTTP {status.group(1)}" if status else f"exit {result.returncode}"
+            raise RuntimeError(f"创建Release草稿失败：{detail}；未下载原文件")
+        release = json.loads(result.stdout)
+        if (type(release.get("id")) is not int or release.get("draft") is not True
+                or release.get("tag_name") != self.tag):
+            raise RuntimeError("创建Release草稿响应无效")
+        self.id = str(release["id"])
 
     def upload(self, path):
         # Retry replacement is limited to assets of this newly created draft.
