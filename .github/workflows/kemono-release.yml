@@ -122,7 +122,6 @@ jobs:
       ALL_PROXY: ""
       NO_PROXY: "*"
       GH_REPO: ${{ github.repository }}
-      ARCHIVE_DIR: ${{ runner.temp }}/kemono-archive
       CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/patreon/user/4068015' }}
     steps:
       - name: Install Tools
@@ -172,6 +171,7 @@ jobs:
             -F draft=true -f name="$service/$user" --jq '.id')
           [[ "$release_id" =~ ^[0-9]+$ ]]
           printf 'RELEASE_TAG=%s\nRELEASE_ID=%s\n' "$tag" "$release_id" >> "$GITHUB_ENV"
+          printf 'ARCHIVE_DIR=%s\n' "$RUNNER_TEMP/kemono-archive" >> "$GITHUB_ENV"
 
       - name: Process archive and upload ready parts
         id: archive
