@@ -1,10 +1,20 @@
+name: Kemono author to Release
+
+# GitHub Actions workflow syntax reference:
+# https://docs.github.com/zh/actions/reference/workflows-and-actions/workflow-syntax
+# https://docs.github.com/zh/actions/reference/workflows-and-actions/metadata-syntax#runs-for-composite-actions
+# https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#yaml-anchors-and-aliases
+
 # 待确认：云端登录/原文件可达性、总容量；后续研究：大作者跨运行恢复。
 # 潜在优化：分片并行；风险：手动运行会创建公开Release，失败保留草稿。
 # 验证重点：托管runner直连、Cookie隔离、完整分页、每卷低于2GB、全部成功才发布。
-name: Kemono author to Release
-run-name: Archive ${{ inputs.creator_url }}
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/*.yml"
   workflow_dispatch:
     inputs:
       creator_url:
@@ -47,39 +57,95 @@ on:
           - debug
         default: warn
 
-permissions:
-  contents: write
+permissions: write-all
 
-concurrency:
-  group: kemono-release-${{ github.ref }}
-  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+
+# concurrency:
+#   group: kemono-release-${{ github.ref }}
+#   cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  DEBCONF_NONINTERACTIVE_SEEN: "true"
+  APT_LISTCHANGES_FRONTEND: none
+  NEEDRESTART_MODE: a
+  FORCE_UNSAFE_CONFIGURE: "1"
+  TZ: Etc/UTC
+  DISPLAY_TZ: Etc/UTC
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  # Git
+  GIT_TERMINAL_PROMPT: "0"
+  # Docker/BuildKit
+  DOCKER_BUILDKIT: "1"
+  COMPOSE_DOCKER_CLI_BUILD: "1"
+
+run-name: Archive ${{ inputs.creator_url }}
 
 jobs:
-  archive:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 330
+  runner-image:
+    name: ubuntu-latest - runner-image
+    runs-on: &step_image ubuntu-latest
+    outputs:
+      RUNNER_IMAGE: ${{ steps.resolve-runner-image.outputs.RUNNER_IMAGE }}
+    steps:
+      - name: Resolve runner-image
+        id: resolve-runner-image
+        uses: Grinch27/github-actions/.github/actions/resolve-runner-image@main
+
+  action:
+    name: >-
+      ${{ needs.runner-image.outputs.RUNNER_IMAGE }} -
+    needs:
+      - runner-image
+    runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    container:
+      image: &container_image ubuntu:devel
+      options: &container_options >-
+        --privileged
+        --user=0:0
+        --pid=host
+        --ipc=host
+        --uts=host
+        --cgroupns=host
+        --cap-add=ALL
+        --security-opt apparmor=unconfined
+        --security-opt seccomp=unconfined
+        --init
+        --pids-limit=-1
+        --shm-size=12g
+        --ulimit nofile=1048576:1048576
+      volumes: &container_volumes
+        - /dev:/dev
+        - /sys:/sys:rw
+        - /sys/fs/cgroup:/sys/fs/cgroup:rw
+        - /run/udev:/run/udev:ro
+        - /lib/modules:/lib/modules:ro
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      ALL_PROXY: ""
-      NO_PROXY: "*"
+      DEBIAN_FRONTEND: noninteractive
+      FORCE_UNSAFE_CONFIGURE: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@main
         with:
           persist-credentials: false
       - name: Install download tools
         run: |
           set -euo pipefail
-          unset http_proxy https_proxy all_proxy no_proxy
-          export no_proxy='*'
+
           sudo apt-get update -qq
           sudo apt-get install -yqq aria2 ca-certificates curl xz-utils
           aria2c --version
           curl --version
           xz --version
+
       - name: Run offline regression tests
         run: python3 -m unittest discover -s tests -q -b
+
       - name: Download, split and publish
         env:
           CREATOR_URL: ${{ inputs.creator_url }}
@@ -93,8 +159,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          unset http_proxy https_proxy all_proxy no_proxy
-          export no_proxy='*'
+
           command -v python3
           command -v gh
           python3 scripts/kemono_release.py
