@@ -1,0 +1,98 @@
+# 待确认：云端登录/原文件可达性、总容量；后续研究：大作者跨运行恢复。
+# 潜在优化：分片并行；风险：手动运行会创建公开Release，失败保留草稿。
+# 验证重点：托管runner直连、Cookie隔离、完整分页、每卷低于2GB、全部成功才发布。
+name: Kemono author to Release
+run-name: Archive ${{ inputs.creator_url }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      creator_url:
+        description: "作者URL"
+        required: true
+        type: string
+        default: "https://kemono.cr/fanbox/user/56018056"
+      max_posts:
+        description: "最多下载帖子数；0表示全部，首次可填3试运行"
+        required: true
+        type: string
+        default: "0"
+      part_mb:
+        description: "每卷上限，十进制MB；允许10–1900"
+        required: true
+        type: string
+        default: "1800"
+      compression:
+        description: "压缩格式；xz参照模板，gzip较快"
+        required: true
+        type: choice
+        options:
+          - xz
+          - gzip
+        default: xz
+      user_agent:
+        description: "下载User-Agent"
+        required: true
+        type: string
+        default: "Mozilla/5.0"
+      log_level:
+        description: "aria2日志级别"
+        required: true
+        type: choice
+        options:
+          - warn
+          - error
+          - notice
+          - info
+          - debug
+        default: warn
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kemono-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install download tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -yqq aria2 ca-certificates curl xz-utils
+          aria2c --version
+          curl --version
+          xz --version
+      - name: Download, split and publish
+        env:
+          CREATOR_URL: ${{ inputs.creator_url }}
+          MAX_POSTS: ${{ inputs.max_posts }}
+          PART_MB: ${{ inputs.part_mb }}
+          COMPRESSION: ${{ inputs.compression }}
+          USER_AGENT: ${{ inputs.user_agent }}
+          LOG_LEVEL: ${{ inputs.log_level }}
+          KEMONO_USERNAME: ${{ secrets.KEMONO_USERNAME }}
+          KEMONO_PASSWORD: ${{ secrets.KEMONO_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          command -v python3
+          command -v gh
+          python3 scripts/kemono_release.py
