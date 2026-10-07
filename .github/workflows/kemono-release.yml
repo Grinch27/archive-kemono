@@ -62,11 +62,7 @@ jobs:
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       ALL_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
-      all_proxy: ""
       NO_PROXY: "*"
-      no_proxy: "*"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -75,6 +71,8 @@ jobs:
       - name: Install download tools
         run: |
           set -euo pipefail
+          unset http_proxy https_proxy all_proxy no_proxy
+          export no_proxy='*'
           sudo apt-get update -qq
           sudo apt-get install -yqq aria2 ca-certificates curl xz-utils
           aria2c --version
@@ -93,6 +91,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          unset http_proxy https_proxy all_proxy no_proxy
+          export no_proxy='*'
           command -v python3
           command -v gh
           python3 scripts/kemono_release.py
