@@ -1,13 +1,12 @@
+# 待确认：云端原文件可达性、总容量；后续研究：大作者跨运行恢复。
+# 潜在优化：分片并行；风险：运行会创建公开Release，失败保留草稿。
+# 验证重点：容器依赖齐全、push参数回退、runner直连、Cookie隔离、每卷低于2GB、全部成功才发布。
 name: Kemono author to Release
 
 # GitHub Actions workflow syntax reference:
 # https://docs.github.com/zh/actions/reference/workflows-and-actions/workflow-syntax
 # https://docs.github.com/zh/actions/reference/workflows-and-actions/metadata-syntax#runs-for-composite-actions
 # https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#yaml-anchors-and-aliases
-
-# 待确认：云端登录/原文件可达性、总容量；后续研究：大作者跨运行恢复。
-# 潜在优化：分片并行；风险：手动运行会创建公开Release，失败保留草稿。
-# 验证重点：托管runner直连、Cookie隔离、完整分页、每卷低于2GB、全部成功才发布。
 
 on:
   push:
@@ -83,7 +82,7 @@ env:
   DOCKER_BUILDKIT: "1"
   COMPOSE_DOCKER_CLI_BUILD: "1"
 
-run-name: Archive ${{ inputs.creator_url }}
+run-name: Archive ${{ inputs.creator_url || 'https://kemono.cr/fanbox/user/56018056' }}
 
 jobs:
   runner-image:
@@ -102,6 +101,7 @@ jobs:
     needs:
       - runner-image
     runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    timeout-minutes: 330
     container:
       image: &container_image ubuntu:devel
       options: &container_options >-
@@ -128,19 +128,18 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
       FORCE_UNSAFE_CONFIGURE: "1"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      NO_PROXY: "*"
     steps:
-      - name: Checkout
-        uses: actions/checkout@main
-        with:
-          persist-credentials: false
-
       - name: Install Tools
         id: apt-download
         working-directory: /
         run: |
-          echo -e "Current working directory: $(pwd)"
-          ls -lh ./
-          echo -e "========== Checkin Container =========="
+          set -euo pipefail
+          unset http_proxy https_proxy all_proxy no_proxy
+          export no_proxy='*'
           run_root() {
             if command -v sudo >/dev/null 2>&1; then
               sudo "$@"
@@ -149,28 +148,37 @@ jobs:
             fi
           }
           run_root apt-get -yqq update
-          run_root apt-get -yqq install aria2 ca-certificates curl xz-utils
+          run_root apt-get -yqq install --no-install-recommends aria2 ca-certificates curl xz-utils python3 gh git
+          python3 --version
+          gh --version
+          git --version
           aria2c --version
           curl --version
           xz --version
+
+      - name: Checkout
+        uses: actions/checkout@main
+        with:
+          persist-credentials: false
 
       - name: Run offline regression tests
         run: python3 -m unittest discover -s tests -q -b
 
       - name: Download, split and publish
         env:
-          CREATOR_URL: ${{ inputs.creator_url }}
-          MAX_POSTS: ${{ inputs.max_posts }}
-          PART_MB: ${{ inputs.part_mb }}
-          COMPRESSION: ${{ inputs.compression }}
-          USER_AGENT: ${{ inputs.user_agent }}
-          LOG_LEVEL: ${{ inputs.log_level }}
+          CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/fanbox/user/56018056' }}
+          MAX_POSTS: ${{ inputs.max_posts || '0' }}
+          PART_MB: ${{ inputs.part_mb || '1800' }}
+          COMPRESSION: ${{ inputs.compression || 'xz' }}
+          USER_AGENT: ${{ inputs.user_agent || 'Mozilla/5.0' }}
+          LOG_LEVEL: ${{ inputs.log_level || 'warn' }}
           KEMONO_USERNAME: ${{ secrets.KEMONO_USERNAME }}
           KEMONO_PASSWORD: ${{ secrets.KEMONO_PASSWORD }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
+          unset http_proxy https_proxy all_proxy no_proxy
+          export no_proxy='*'
           command -v python3
           command -v gh
           python3 scripts/kemono_release.py
