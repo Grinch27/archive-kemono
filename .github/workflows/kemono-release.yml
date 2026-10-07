@@ -78,6 +78,8 @@ jobs:
           aria2c --version
           curl --version
           xz --version
+      - name: Run offline regression tests
+        run: python3 -m unittest discover -s tests -q -b
       - name: Download, split and publish
         env:
           CREATOR_URL: ${{ inputs.creator_url }}
