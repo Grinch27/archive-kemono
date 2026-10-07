@@ -1,0 +1,63 @@
+# Private backups, scratch file, logs, and local continuation context.
+/backups/
+/tmp
+/logs/
+/CONTINUATION.md
+favorite_artists.*
+favorite_posts.*
+favorites-export.*
+
+# Authentication material must be supplied through GitHub Actions Secrets.
+secrets/
+credentials/
+cookies/
+sessions/
+.env
+.env.*
+.envrc
+.netrc
+.authinfo
+.git-credentials
+.npmrc
+.pypirc
+cookies
+cookie
+cookie*.*
+cookiejar
+.cookies
+.cookies.*
+*.cookies
+session
+session*.*
+.session
+.session.*
+credentials
+credentials*.*
+secrets
+secrets*.*
+token
+tokens
+token.*
+tokens*.*
+auth.json
+auth.yaml
+auth.yml
+*.har
+
+# Private keys and credential containers.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+
+# Logs can contain account data and request headers.
+*.log
+*.log.*
+
+# Local Python caches.
+__pycache__/
+*.py[cod]
