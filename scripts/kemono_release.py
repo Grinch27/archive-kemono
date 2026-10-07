@@ -5,6 +5,7 @@
 # 验证重点：直连、Cookie仅API同源、完整分页/详情、路径安全、分卷<2GB、失败不发布；不算SHA256。
 
 import gzip
+from collections import deque
 import http.client
 import http.cookiejar
 import io
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -294,15 +296,25 @@ class DiskReader:
 
 
 def run_download(command, *, env, path, budget):
-    process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = deque(maxlen=16)
+    def drain():
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                return
+            output.append(chunk)
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
     deadline, next_progress = time.monotonic() + 1800, time.monotonic() + 30
     try:
         while True:
             try:
                 code = process.wait(timeout=1)
+                reader.join(timeout=5)
                 if path.exists() and path.stat().st_size > budget:
                     return subprocess.CompletedProcess(command, -100)
-                return subprocess.CompletedProcess(command, code)
+                return subprocess.CompletedProcess(command, code, stderr=b"".join(output).decode("utf-8", errors="replace"))
             except subprocess.TimeoutExpired:
                 size = path.stat().st_size if path.exists() else 0
                 if size > budget:
@@ -320,6 +332,16 @@ def run_download(command, *, env, path, budget):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        reader.join(timeout=5)
+        process.stdout.close()
+
+
+def download_error(result):
+    lines = [line[:500] for line in (getattr(result, "stderr", "") or "").splitlines()
+             if re.search(r"error|failed|timeout|exception|certificate|could not", line, re.I)]
+    print(f"下载器退出码{result.returncode}。", flush=True)
+    for line in lines[-4:]:
+        print("下载错误摘要：" + line, flush=True)
 
 
 def open_media(url, directory, part_bytes):
@@ -349,9 +371,14 @@ def open_media(url, directory, part_bytes):
                 print("原文件超过暂存预算，切换流式读取。", flush=True)
                 return MediaReader(url)
             good = result.returncode == 0 and path.is_file()
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except subprocess.TimeoutExpired:
+            result = subprocess.CompletedProcess(aria, 124, stderr="aria2 timeout")
+            good = False
+        except FileNotFoundError:
+            result = subprocess.CompletedProcess(aria, 127, stderr="aria2 executable not found")
             good = False
         if not good:
+            download_error(result)
             print("aria2未完成，清除分段临时文件后使用curl。", flush=True)
             path.unlink(missing_ok=True)
             Path(str(path) + ".aria2").unlink(missing_ok=True)
@@ -372,10 +399,12 @@ def open_media(url, directory, part_bytes):
                     if result.returncode in (33, 36):
                         path.unlink(missing_ok=True)
                 except subprocess.TimeoutExpired:
+                    result = subprocess.CompletedProcess(curl, 124, stderr="curl timeout")
                     done = False
                 if done:
                     good = True
                     break
+                download_error(result)
                 if attempt < 2:
                     time.sleep(2 ** (attempt + 1))
             if not good:

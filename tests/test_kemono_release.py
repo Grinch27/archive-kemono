@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
@@ -257,6 +258,13 @@ class ArchiveTests(unittest.TestCase):
                 self.assertIs(reader, probe)
                 self.assertEqual(list(Path(temp).iterdir()), [])
                 reader.close()
+
+    def test_command_diagnostics_capture_without_network(self):
+        with tempfile.TemporaryDirectory() as temp:
+            command = [sys.executable, "-c", "print('fixture ERROR timeout'); raise SystemExit(3)"]
+            result = app.run_download(command, env=os.environ.copy(), path=Path(temp) / "fixture", budget=100)
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("fixture ERROR timeout", result.stderr)
 
     def test_local_execution_is_blocked_before_network(self):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch.object(app, "Api") as api:

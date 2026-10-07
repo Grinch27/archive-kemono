@@ -1,0 +1,27 @@
+# 待确认：官方媒体节点直连可达性；后续研究：根据结果修复下载地址。
+# 潜在优化：完成诊断后保留为故障检查入口；风险：只请求公开HEAD，无凭据或媒体正文。
+# 验证重点：托管runner直连、IPv4 DNS/TLS/HTTP、节点与官方站点对比。
+name: Kemono network check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe official nodes without downloading media
+        run: |
+          set -u
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
+          export NO_PROXY='*' no_proxy='*'
+          path='/data/a5/16/a516d05ac9ea5a60ef1a8d33215d9f487c76f1624d1a5d44a45840063e0c67f2.jpg'
+          for host in kemono.cr n1.kemono.cr n2.kemono.cr n3.kemono.cr n4.kemono.cr img.kemono.cr; do
+            printf '\nNode: %s\n' "$host"
+            getent ahostsv4 "$host" | awk '!seen[$1]++ {print "IPv4:", $1}'
+            curl --disable --ipv4 --noproxy '*' --head --silent --show-error \
+              --connect-timeout 5 --max-time 8 --output /dev/null \
+              --write-out 'HTTP=%{http_code} IP=%{remote_ip} TYPE=%{content_type} TIME=%{time_total}\n' \
+              "https://${host}${path}" || true
+          done
