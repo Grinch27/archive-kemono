@@ -20,7 +20,7 @@ on:
         description: "作者URL"
         required: true
         type: string
-        default: "https://kemono.cr/fanbox/user/56018056"
+        default: "https://kemono.cr/patreon/user/4068015"
       max_posts:
         description: "最多下载帖子数；0表示全部，首次可填3试运行"
         required: true
@@ -71,7 +71,7 @@ env:
   DOCKER_BUILDKIT: "1"
   COMPOSE_DOCKER_CLI_BUILD: "1"
 
-run-name: Archive ${{ inputs.creator_url || 'https://kemono.cr/fanbox/user/56018056' }}
+run-name: Archive ${{ inputs.creator_url || 'https://kemono.cr/patreon/user/4068015' }}
 
 jobs:
   runner-image:
@@ -154,7 +154,7 @@ jobs:
 
       - name: Download, split and publish
         env:
-          CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/fanbox/user/56018056' }}
+          CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/patreon/user/4068015' }}
           MAX_POSTS: ${{ inputs.max_posts || '0' }}
           PART_MB: ${{ inputs.part_mb || '1800' }}
           COMPRESSION: ${{ inputs.compression || 'xz' }}

@@ -361,7 +361,7 @@ def add_json(archive, name, value):
 def main():
     if os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("原文件下载和Release发布仅允许在GitHub Actions运行")
-    source = os.environ.get("CREATOR_URL", BASE + "/fanbox/user/56018056")
+    source = os.environ.get("CREATOR_URL", BASE + "/patreon/user/4068015")
     service, user = creator_parts(source)
     try:
         limit, part_mb = int(os.environ.get("MAX_POSTS", "0")), int(os.environ.get("PART_MB", "1800"))
