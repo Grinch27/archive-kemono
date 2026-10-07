@@ -1,6 +1,6 @@
 # 待确认：云端原文件可达性、总容量；后续研究：大作者跨运行恢复。
 # 潜在优化：分片并行；风险：运行会创建公开Release，失败保留草稿。
-# 验证重点：容器依赖齐全、push参数回退、runner直连、Cookie隔离、每卷低于2GB、全部成功才发布。
+# 验证重点：容器依赖齐全、push参数回退、runner直连、Cookie隔离、每卷低于2GB、缺文件时标记INCOMPLETE并保存清单。
 name: Kemono author to Release
 
 # GitHub Actions workflow syntax reference:
@@ -43,18 +43,7 @@ on:
         description: "下载User-Agent"
         required: true
         type: string
-        default: "Mozilla/5.0"
-      log_level:
-        description: "aria2日志级别"
-        required: true
-        type: choice
-        options:
-          - warn
-          - error
-          - notice
-          - info
-          - debug
-        default: warn
+        default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7194.92 Safari/537.36"
 
 permissions: write-all
 
@@ -148,11 +137,10 @@ jobs:
             fi
           }
           run_root apt-get -yqq update
-          run_root apt-get -yqq install --no-install-recommends aria2 ca-certificates curl xz-utils python3 gh git
+          run_root apt-get -yqq install --no-install-recommends ca-certificates curl xz-utils python3 gh git
           python3 --version
           gh --version
           git --version
-          aria2c --version
           curl --version
           xz --version
 
@@ -170,8 +158,7 @@ jobs:
           MAX_POSTS: ${{ inputs.max_posts || '0' }}
           PART_MB: ${{ inputs.part_mb || '1800' }}
           COMPRESSION: ${{ inputs.compression || 'xz' }}
-          USER_AGENT: ${{ inputs.user_agent || 'Mozilla/5.0' }}
-          LOG_LEVEL: ${{ inputs.log_level || 'warn' }}
+          USER_AGENT: ${{ inputs.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7194.92 Safari/537.36' }}
           KEMONO_USERNAME: ${{ secrets.KEMONO_USERNAME }}
           KEMONO_PASSWORD: ${{ secrets.KEMONO_PASSWORD }}
           GH_TOKEN: ${{ github.token }}
@@ -182,3 +169,12 @@ jobs:
           command -v python3
           command -v gh
           python3 scripts/kemono_release.py
+
+      - name: Preserve failed-file list
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: failed-files-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failed-files.json
+          if-no-files-found: ignore
+          retention-days: 30

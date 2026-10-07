@@ -1,20 +1,18 @@
 # 待确认：真实API/runner行为；后续研究：云端小样本；潜在优化：更多服务样本。
 # 风险：所有API、媒体及Release均模拟，不能据此宣称真实下载成功。
-# 验证重点：分页、路径/域名、Range恢复、分卷重组、上传校验与失败不发布；本地不下载媒体。
+# 验证重点：3次/30秒、失败去重和持久化、部分归档可解压、分卷重组、上传失败不发布；本地不下载媒体。
 import gzip
 import importlib.util
 import io
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-import urllib.request
 
 SPEC = importlib.util.spec_from_file_location("kemono_release", Path(__file__).resolve().parents[1] / "scripts/kemono_release.py")
 app = importlib.util.module_from_spec(SPEC)
@@ -23,21 +21,6 @@ SPEC.loader.exec_module(app)
 
 def post(number):
     return {"id": str(number), "service": "fanbox", "user": "56018056"}
-
-
-class Response(io.BytesIO):
-    def __init__(self, body, headers, status=200):
-        super().__init__(body)
-        self.headers, self.status = headers, status
-
-
-class Opener:
-    def __init__(self, *responses):
-        self.responses, self.requests = list(responses), []
-
-    def open(self, request, timeout):
-        self.requests.append(request)
-        return self.responses.pop(0)
 
 
 class ArchiveTests(unittest.TestCase):
@@ -83,24 +66,6 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             app.enumerate_posts(Api(), "fanbox", "56018056", 0)
 
-    def test_range_recovery_without_cookie(self):
-        first = Response(b"abc", {"Content-Length": "6", "ETag": '"v1"'})
-        second = Response(b"def", {"Content-Range": "bytes 3-5/6", "ETag": '"v1"'}, 206)
-        opener = Opener(first, second)
-        with patch.object(app.time, "sleep"):
-            media = app.MediaReader("https://n1.kemono.cr/data/a/file", opener)
-            self.assertEqual(media.read(6), b"abcdef")
-        self.assertEqual(opener.requests[1].get_header("Range"), "bytes=3-")
-        self.assertEqual(opener.requests[1].get_header("If-range"), '"v1"')
-        self.assertTrue(all(r.get_header("Cookie") is None for r in opener.requests))
-        media.close()
-
-    def test_wrong_range_or_missing_length_stops(self):
-        with self.assertRaises(RuntimeError):
-            app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"abc", {})))
-        opener = Opener(Response(b"abc", {"Content-Length": "6"}), Response(b"abcdef", {"Content-Length": "6"}))
-        with patch.object(app.time, "sleep"), self.assertRaises(RuntimeError):
-            app.MediaReader("https://n1.kemono.cr/data/a/file", opener).read(6)
 
     def test_tar_gzip_split_reassembles_exactly(self):
         parts, sizes = [], []
@@ -169,102 +134,68 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(args[0][:5], ["gh", "api", "--method", "POST", "repos/fixture/repo/releases"])
             self.assertTrue(json.loads(kwargs["input"])["draft"])
 
-    def test_aria2_failure_clears_sparse_file_before_curl(self):
+
+    def test_default_user_agent_matches_workflow(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIn("Chrome/138.0.7194.92", app.user_agent())
+            workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/kemono-release.yml").read_text()
+            self.assertIn(f'default: "{app.DEFAULT_UA}"', workflow)
+            self.assertIn(f"inputs.user_agent || '{app.DEFAULT_UA}'", workflow)
+
+    def test_file_attempts_timeout_cleanup_and_secret_isolation(self):
         with tempfile.TemporaryDirectory() as temp:
-            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
-            calls = []
-            def run(command, **kwargs):
-                calls.append(command[0])
+            def download(command, **kwargs):
+                self.assertEqual(command[0], "curl")
+                self.assertEqual(kwargs["timeout"], 30)
+                self.assertEqual(command[command.index("--max-time") + 1], "30")
+                self.assertEqual(command[command.index("--retry") + 1], "0")
+                self.assertEqual(command[command.index("--noproxy") + 1], "*")
                 self.assertNotIn("KEMONO_PASSWORD", kwargs["env"])
                 self.assertNotIn("GH_TOKEN", kwargs["env"])
-                if command[0] == "aria2c":
-                    directory = Path(next(x[6:] for x in command if x.startswith("--dir=")))
-                    target = directory / "original.bin"
-                    target.write_bytes(b"\0" * 8)
-                    Path(str(target) + ".aria2").write_text("fixture control")
-                    return SimpleNamespace(returncode=1)
+                self.assertNotIn("--cookie", command)
                 target = Path(command[command.index("--output") + 1])
                 self.assertFalse(target.exists())
-                self.assertFalse(Path(str(target) + ".aria2").exists())
-                target.write_bytes(b"original")
-                return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl", "KEMONO_PASSWORD": "fixture", "GH_TOKEN": "fixture"}), patch.object(app, "MediaReader", return_value=probe) as stream, patch.object(app, "run_download", side_effect=run):
-                reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
-                self.assertEqual(reader.read(), b"original")
-                reader.close()
-                stream.assert_not_called()
-            self.assertEqual(calls, ["aria2c", "curl"])
+                target.write_bytes(b"partial")
+                raise subprocess.TimeoutExpired(command, 30)
+            with patch.dict(os.environ, {"KEMONO_PASSWORD":"fixture", "GH_TOKEN":"fixture"}), patch.object(app.subprocess, "run", side_effect=download) as run:
+                with self.assertRaises(app.DownloadFailure) as failure:
+                    app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual((failure.exception.code, failure.exception.attempts), (28, 3))
             self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_aria2_success_skips_curl(self):
+    def test_file_retry_success_stops_early(self):
         with tempfile.TemporaryDirectory() as temp:
-            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
-            def run(command, **kwargs):
-                self.assertEqual(command[0], "aria2c")
-                directory = Path(next(x[6:] for x in command if x.startswith("--dir=")))
-                (directory / "original.bin").write_bytes(b"original")
-                return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe) as stream, patch.object(app, "run_download", side_effect=run) as command:
-                reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
-                self.assertEqual(reader.read(), b"original")
-                reader.close()
-                self.assertEqual(command.call_count, 1)
-                stream.assert_not_called()
-
-    def test_changed_media_version_stops_resume(self):
-        opener = Opener(Response(b"abc", {"Content-Length": "6", "ETag": '"v1"'}),
-                        Response(b"def", {"Content-Range": "bytes 3-5/6", "ETag": '"v2"'}, 206))
-        with patch.object(app.time, "sleep"), self.assertRaises(RuntimeError):
-            app.MediaReader("https://n1.kemono.cr/data/a/file", opener).read(6)
-
-    def test_aria2_timeout_uses_curl_and_curl_resumes(self):
-        with tempfile.TemporaryDirectory() as temp:
-            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
-            curl_attempts = []
-            def run(command, **kwargs):
-                if command[0] == "aria2c":
-                    raise subprocess.TimeoutExpired("aria2c", 1)
+            attempts = []
+            def download(command, **kwargs):
                 target = Path(command[command.index("--output") + 1])
-                self.assertIn("--continue-at", command)
-                curl_attempts.append(command)
-                if len(curl_attempts) == 1:
-                    target.write_bytes(b"ori")
-                    return SimpleNamespace(returncode=1)
-                self.assertEqual(target.read_bytes(), b"ori")
-                target.write_bytes(b"original")
-                return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app, "run_download", side_effect=run), patch.object(app.time, "sleep"):
+                self.assertFalse(target.exists())
+                attempts.append(1)
+                target.write_bytes(b"original" if len(attempts) == 2 else b"partial")
+                return SimpleNamespace(returncode=0 if len(attempts) == 2 else 28)
+            with patch.object(app.subprocess, "run", side_effect=download):
                 reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
                 self.assertEqual(reader.read(), b"original")
+                self.assertEqual(reader.offset, reader.size)
                 reader.close()
-            self.assertEqual(len(curl_attempts), 2)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_large_original_streams_without_download_tools(self):
-        with tempfile.TemporaryDirectory() as temp:
-            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app.shutil, "disk_usage") as usage, patch.object(app.subprocess, "run") as run:
-                usage.return_value.free = 1
-                reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
-                self.assertIs(reader, probe)
-                self.assertEqual(reader.read(), b"original")
-                reader.close()
-                run.assert_not_called()
+    def test_disk_budget_prevents_download(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(app.shutil, "disk_usage") as usage, patch.object(app.subprocess, "run") as run:
+            usage.return_value.free = 1
+            with self.assertRaises(RuntimeError):
+                app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
+            run.assert_not_called()
 
-    def test_download_budget_switches_to_stream(self):
-        with tempfile.TemporaryDirectory() as temp:
-            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app, "run_download", return_value=SimpleNamespace(returncode=-100)):
-                reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
-                self.assertIs(reader, probe)
-                self.assertEqual(list(Path(temp).iterdir()), [])
-                reader.close()
-
-    def test_command_diagnostics_capture_without_network(self):
-        with tempfile.TemporaryDirectory() as temp:
-            command = [sys.executable, "-c", "print('fixture ERROR timeout'); raise SystemExit(3)"]
-            result = app.run_download(command, env=os.environ.copy(), path=Path(temp) / "fixture", budget=100)
-            self.assertEqual(result.returncode, 3)
-            self.assertIn("fixture ERROR timeout", result.stderr)
+    def test_partial_release_is_explicitly_marked(self):
+        release = app.Release("fixture/repo", "fixture-tag")
+        release.title = "fixture"
+        with patch.object(release, "command") as command:
+            release.publish("missing files", incomplete=True)
+            args = command.call_args.args
+            self.assertIn("--prerelease=true", args)
+            self.assertIn("fixture · INCOMPLETE", args)
 
     def test_local_execution_is_blocked_before_network(self):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch.object(app, "Api") as api:
@@ -272,56 +203,87 @@ class ArchiveTests(unittest.TestCase):
                 app.main()
             api.assert_not_called()
 
-    def test_publish_only_after_complete_archive(self):
+    def test_complete_archive_is_readable(self):
         self.exercise_main(fail=False)
 
     def test_gzip_selection_publishes_readable_archive(self):
         self.exercise_main(fail=False, compression="gzip")
 
-    def test_download_failure_does_not_publish(self):
+    def test_failures_are_deduplicated_and_later_files_are_archived(self):
         self.exercise_main(fail=True)
 
-    def exercise_main(self, fail, compression="xz"):
-        events, assets = [], {}
-        detail = {"post": {**post(1), "content": "fixture body", "file": {"path": "/a/file.bin"}},
-                  "previews": [{"path": "/a/file.bin", "server": "https://n1.kemono.cr"}]}
+    def test_failure_list_survives_archive_upload_error(self):
+        self.exercise_main(fail=True, upload_error=True)
+
+    def exercise_main(self, fail, compression="xz", upload_error=False):
+        events, assets, calls, published = [], {}, [], []
         class Api:
             def login(self): pass
             def get(self, path):
                 if path.endswith("/profile"):
-                    return {"service": "fanbox", "id": "56018056", "post_count": 1}
-                if "/posts?" in path: return [post(1)]
-                return detail
+                    return {"service": "fanbox", "id": "56018056", "post_count": 2}
+                if "/posts?" in path: return [post(1), post(2)]
+                number = int(path.rsplit("/", 1)[1])
+                return {"post": {**post(number), "content": "fixture body", "file": {"path": "/a/file.bin"},
+                                 "attachments": [{"path":"/a/later.bin", "server":"https://n1.kemono.cr"}] if number == 2 else []},
+                        "previews": [{"path":"/a/file.bin", "server":"https://n1.kemono.cr"}]}
         class Release:
             def __init__(self, repo, tag): pass
             def create(self, title): events.append("create")
             def upload(self, path):
+                if upload_error: raise RuntimeError("fixture upload failure")
                 events.append("upload")
                 assets[path.name] = path.read_bytes()
-            def publish(self, notes): events.append("publish")
+            def publish(self, notes, incomplete=False):
+                events.append("publish")
+                published.append((notes, incomplete))
+        class Reader(io.BytesIO):
+            def __init__(self):
+                super().__init__(b"original")
+                self.size, self.offset = 8, 0
+            def read(self, n=-1):
+                value = super().read(n)
+                self.offset += len(value)
+                return value
+        def reader(url, directory, part_bytes):
+            calls.append(url)
+            if fail and url.endswith("/file.bin"):
+                raise app.DownloadFailure(28, 3)
+            return Reader()
         with tempfile.TemporaryDirectory() as temp:
-            env = {"GITHUB_ACTIONS": "true", "CREATOR_URL": "https://kemono.cr/fanbox/user/56018056",
-                   "MAX_POSTS": "0", "PART_MB": "10", "GITHUB_REPOSITORY": "fixture/repo", "GH_TOKEN": "fixture",
-                   "GITHUB_SHA": "fixture", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "RUNNER_TEMP": temp,
-                   "COMPRESSION": compression, "DOWNLOAD_MODE": "stream"}
-            original_reader = app.MediaReader
-            def reader(url):
-                if fail: raise RuntimeError("fixture media failure")
-                return original_reader(url, Opener(Response(b"original", {"Content-Length": "8"})))
-            with patch.dict(os.environ, env), patch.object(app, "Api", Api), patch.object(app, "Release", Release), patch.object(app, "MediaReader", reader):
-                if fail:
+            env = {"GITHUB_ACTIONS":"true", "CREATOR_URL":"https://kemono.cr/fanbox/user/56018056",
+                   "MAX_POSTS":"0", "PART_MB":"10", "GITHUB_REPOSITORY":"fixture/repo", "GH_TOKEN":"fixture",
+                   "GITHUB_SHA":"fixture", "GITHUB_RUN_ID":"123", "GITHUB_RUN_ATTEMPT":"1", "RUNNER_TEMP":temp,
+                   "COMPRESSION":compression}
+            with patch.dict(os.environ, env), patch.object(app, "Api", Api), patch.object(app, "Release", Release), patch.object(app, "open_media", reader):
+                if upload_error:
                     with self.assertRaises(RuntimeError): app.main()
                     self.assertNotIn("publish", events)
+                    self.assertEqual(len(json.loads((Path(temp)/"failed-files.json").read_text())["files"]), 1)
+                    return
+                app.main()
+            self.assertEqual(len(calls), 2)  # Shared failed/successful path is tried only once.
+            self.assertEqual(events[-1], "publish")
+            self.assertEqual(published[0][1], fail)
+            manifest = json.loads(assets["archive-manifest.json"])
+            self.assertEqual(manifest["file_count"], 1 if fail else 2)
+            self.assertEqual(manifest["original_bytes"], 8 if fail else 16)
+            self.assertEqual(manifest["failed_file_count"], int(fail))
+            self.assertEqual(manifest["complete"], not fail)
+            self.assertEqual(manifest["media_complete"], not fail)
+            parts = b"".join(assets[p["name"]] for p in manifest["assets"])
+            with tarfile.open(fileobj=io.BytesIO(parts), mode="r:*") as archive:
+                self.assertEqual(archive.extractfile("media/a/later.bin").read(), b"original")
+                self.assertEqual(json.load(archive.extractfile("posts/2.json"))["post"]["content"], "fixture body")
+                if fail:
+                    failures = json.loads(assets["failed-files.json"])
+                    self.assertEqual(json.load(archive.extractfile("metadata/failed-files.json")), failures)
+                    item = failures["files"][0]
+                    self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 3, 30, 28))
+                    self.assertNotIn("media/a/file.bin", archive.getnames())
+                    self.assertIn("INCOMPLETE", published[0][0])
                 else:
-                    app.main()
-                    self.assertEqual(events[-1], "publish")
-                    manifest = json.loads(assets["archive-manifest.json"])
-                    self.assertEqual(manifest["file_count"], 1)
-                    self.assertEqual(manifest["original_bytes"], 8)
-                    parts = b"".join(assets[p["name"]] for p in manifest["assets"])
-                    with tarfile.open(fileobj=io.BytesIO(parts), mode="r:*") as archive:
-                        self.assertEqual(archive.extractfile("media/a/file.bin").read(), b"original")
-                        self.assertEqual(json.load(archive.extractfile("posts/1.json"))["post"]["content"], "fixture body")
+                    self.assertEqual(archive.extractfile("media/a/file.bin").read(), b"original")
 
 
 if __name__ == "__main__":

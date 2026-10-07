@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # 待确认：云端登录与原文件可达性、作者总容量；只在GitHub Actions执行下载和发布。
-# 后续研究：跨运行恢复、无长度媒体；潜在优化：并行详情预取、分片任务。
-# 风险：公开作者正文/原文件，外链仅保留引用；失败保留未公开草稿；同次运行媒体可Range续传。
-# 验证重点：直连、Cookie仅API同源、完整分页/详情、路径安全、分卷<2GB、失败不发布；不算SHA256。
+# 后续研究：按失败清单补下；潜在优化：并行详情预取。
+# 风险：每次完整下载限30秒，大文件可能失败；缺文件时发布明确标记的部分归档。
+# 验证重点：直连、Cookie隔离、每文件最多3次、失败清单持久化、tar可解压、分卷<2GB；不算SHA256。
 
 import gzip
-from collections import deque
-import http.client
 import http.cookiejar
 import io
 import json
@@ -18,7 +16,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,10 +26,12 @@ from pathlib import Path, PurePosixPath
 BASE = "https://kemono.cr"
 PART_MAX = 1_900_000_000  # Also below decimal 2GB, not just GitHub's 2GiB.
 TRANSIENT = {429, 500, 502, 503, 504}
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7194.92 Safari/537.36"
+FILE_ATTEMPTS, FILE_TIMEOUT = 3, 30
 
 
 def user_agent():
-    value = os.environ.get("USER_AGENT", "Mozilla/5.0")
+    value = os.environ.get("USER_AGENT", DEFAULT_UA)
     if not value or "\r" in value or "\n" in value:
         raise ValueError("User-Agent为空或包含换行")
     return value
@@ -189,98 +188,6 @@ def enumerate_posts(api, service, user, limit):
         offset += 50
 
 
-class MediaReader:
-    """Stream originals, resuming network interruptions with verified byte ranges."""
-    def __init__(self, url, opener=None):
-        if not media_host(url):
-            raise ValueError("非官方下载地址")
-        self.url = url
-        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), SafeRedirect(media=True))
-        self.offset, self.failures, self.size = 0, 0, None
-        self.response, self.validator = None, None
-        self._open()
-
-    def _open(self):
-        if self.response is not None:
-            self.response.close()
-            self.response = None
-        while True:
-            headers = {"User-Agent": user_agent(), "Accept-Encoding": "identity",
-                       "Range": f"bytes={self.offset}-"}
-            if self.validator:
-                headers["If-Range"] = self.validator
-            try:
-                r = self.opener.open(urllib.request.Request(self.url, headers=headers), timeout=30)
-                if r.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
-                    r.close()
-                    raise RuntimeError("原文件被传输压缩，不能确认原始字节")
-                if r.status == 206:
-                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
-                    if not match:
-                        r.close()
-                        raise RuntimeError("媒体Content-Range无效")
-                    start, end, size = map(int, match.groups())
-                    if start != self.offset or end != size - 1:
-                        r.close()
-                        raise RuntimeError("媒体Range起止不符")
-                elif r.status == 200 and self.offset == 0:
-                    length = r.headers.get("Content-Length")
-                    if not length or not length.isdigit():
-                        r.close()
-                        raise RuntimeError("媒体无可验证长度，停止归档")
-                    size = int(length)
-                else:
-                    r.close()
-                    raise RuntimeError("媒体不支持安全断点续传")
-                if self.size is not None and size != self.size:
-                    r.close()
-                    raise RuntimeError("重试时媒体长度变化")
-                validator = r.headers.get("ETag") or r.headers.get("Last-Modified")
-                if self.validator and validator and validator != self.validator:
-                    r.close()
-                    raise RuntimeError("重试时媒体版本变化")
-                self.size, self.validator, self.response = size, validator, r
-                return
-            except urllib.error.HTTPError as e:
-                code = e.code
-                e.close()
-                if code not in TRANSIENT:
-                    raise RuntimeError(f"媒体请求失败：HTTP {code}") from None
-                self._retry()
-            except (urllib.error.URLError, TimeoutError, OSError):
-                self._retry()
-
-    def _retry(self):
-        self.failures += 1
-        if self.failures > 5:
-            raise RuntimeError("媒体超过5次恢复尝试") from None
-        print(f"原文件连接/读取重试{self.failures}/5，已接收{self.offset}字节。", flush=True)
-        time.sleep(min(2 ** self.failures, 16))
-
-    def read(self, length=-1):
-        wanted = self.size - self.offset if length < 0 else min(length, self.size - self.offset)
-        chunks, total = [], 0
-        while total < wanted:
-            try:
-                chunk = self.response.read(wanted - total)
-            except http.client.IncompleteRead as e:
-                chunk = e.partial
-            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
-                chunk = b""
-            if chunk:
-                chunks.append(chunk)
-                self.offset += len(chunk)
-                total += len(chunk)
-            if total < wanted and not chunk:
-                self._retry()
-                self._open()
-        return b"".join(chunks)
-
-    def close(self):
-        if self.response is not None:
-            self.response.close()
-
-
 class DiskReader:
     def __init__(self, directory, path, size):
         self.directory, self.file, self.size, self.offset = directory, path.open("rb"), size, 0
@@ -295,129 +202,57 @@ class DiskReader:
         self.directory.cleanup()
 
 
-def run_download(command, *, env, path, budget):
-    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    output = deque(maxlen=16)
-    def drain():
-        while True:
-            chunk = process.stdout.read(4096)
-            if not chunk:
-                return
-            output.append(chunk)
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
-    deadline, next_progress = time.monotonic() + 1800, time.monotonic() + 30
-    try:
-        while True:
-            try:
-                code = process.wait(timeout=1)
-                reader.join(timeout=5)
-                if path.exists() and path.stat().st_size > budget:
-                    return subprocess.CompletedProcess(command, -100)
-                return subprocess.CompletedProcess(command, code, stderr=b"".join(output).decode("utf-8", errors="replace"))
-            except subprocess.TimeoutExpired:
-                size = path.stat().st_size if path.exists() else 0
-                if size > budget:
-                    return subprocess.CompletedProcess(command, -100)
-                if time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(command, 1800)
-                if time.monotonic() >= next_progress:
-                    print(f"{command[0]}已暂存{size}字节。", flush=True)
-                    next_progress = time.monotonic() + 30
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        reader.join(timeout=5)
-        process.stdout.close()
-
-
-def download_error(result):
-    lines = [line[:500] for line in (getattr(result, "stderr", "") or "").splitlines()
-             if re.search(r"error|failed|timeout|exception|certificate|could not", line, re.I)]
-    print(f"下载器退出码{result.returncode}。", flush=True)
-    for line in lines[-4:]:
-        print("下载错误摘要：" + line, flush=True)
+class DownloadFailure(RuntimeError):
+    def __init__(self, code, attempts):
+        self.code, self.attempts = code, attempts
+        super().__init__(f"curl exit {code}; {attempts} attempts exhausted")
 
 
 def open_media(url, directory, part_bytes):
     if not media_host(url):
         raise ValueError("非官方下载地址")
     budget = shutil.disk_usage(directory).free - part_bytes - 256_000_000
-    if os.environ.get("DOWNLOAD_MODE") == "stream" or budget <= 0:
-        print("使用流式原文件读取，避免完整原文件占用磁盘。", flush=True)
-        return MediaReader(url)
+    if budget <= 0:
+        raise RuntimeError("runner磁盘不足，停止下载")
     staging = tempfile.TemporaryDirectory(prefix="original-", dir=directory)
     path = Path(staging.name) / "original.bin"
-    # Download tools need neither account credentials nor the GitHub token.
     env = {k: v for k, v in os.environ.items() if not k.startswith(("KEMONO_", "GH_", "GITHUB_"))}
-    level = os.environ.get("LOG_LEVEL", "warn")
+    command = ["curl", "--disable", "--silent", "--show-error", "--fail", "--location",
+               "--proto", "=https", "--proto-redir", "=https", "--noproxy", "*", "--retry", "0",
+               "--connect-timeout", str(FILE_TIMEOUT), "--max-time", str(FILE_TIMEOUT),
+               "--max-filesize", str(budget), "--user-agent", user_agent(),
+               "--header", "Accept-Encoding: identity", "--output", str(path), url]
     try:
-        aria = ["aria2c", "--no-conf=true", "--summary-interval=0", f"--console-log-level={level}", "--download-result=hide",
-                "--continue=true", "--max-tries=3", "--retry-wait=1", "--timeout=30", "--connect-timeout=15",
-                "--file-allocation=none", "--max-connection-per-server=4", "--split=4", "--min-split-size=10M",
-                "--allow-overwrite=true", "--auto-file-renaming=false", "--follow-torrent=false",
-                "--follow-metalink=false", "--all-proxy=", "--no-proxy=*", f"--user-agent={user_agent()}",
-                "--header=Accept-Encoding: identity", f"--dir={staging.name}", "--out=original.bin", url]
-        try:
-            print("启动aria2原文件下载。", flush=True)
-            result = run_download(aria, env=env, path=path, budget=budget)
-            if result.returncode == -100:
-                staging.cleanup()
-                print("原文件超过暂存预算，切换流式读取。", flush=True)
-                return MediaReader(url)
-            good = result.returncode == 0 and path.is_file()
-        except subprocess.TimeoutExpired:
-            result = subprocess.CompletedProcess(aria, 124, stderr="aria2 timeout")
-            good = False
-        except FileNotFoundError:
-            result = subprocess.CompletedProcess(aria, 127, stderr="aria2 executable not found")
-            good = False
-        if not good:
-            download_error(result)
-            print("aria2未完成，清除分段临时文件后使用curl。", flush=True)
-            path.unlink(missing_ok=True)
-            Path(str(path) + ".aria2").unlink(missing_ok=True)
-            for attempt in range(3):
-                curl = ["curl", "--disable", "--silent", "--show-error", "--fail", "--location", "--proto", "=https",
-                        "--proto-redir", "=https", "--noproxy", "*", "--connect-timeout", "15",
-                        "--speed-limit", "1024", "--speed-time", "120", "--continue-at", "-",
-                        "--user-agent", user_agent(), "--header", "Accept-Encoding: identity",
-                        "--output", str(path), url]
-                try:
-                    print(f"启动curl原文件下载，第{attempt + 1}/3次。", flush=True)
-                    result = run_download(curl, env=env, path=path, budget=budget)
-                    if result.returncode == -100:
-                        staging.cleanup()
-                        print("原文件超过暂存预算，切换流式读取。", flush=True)
-                        return MediaReader(url)
-                    done = result.returncode == 0 and path.is_file()
-                    if result.returncode in (33, 36):
-                        path.unlink(missing_ok=True)
-                except subprocess.TimeoutExpired:
-                    result = subprocess.CompletedProcess(curl, 124, stderr="curl timeout")
-                    done = False
-                if done:
-                    good = True
-                    break
-                download_error(result)
-                if attempt < 2:
-                    time.sleep(2 ** (attempt + 1))
-            if not good:
-                raise RuntimeError("aria2/curl下载未完整完成")
-        return DiskReader(staging, path, path.stat().st_size)
-    except Exception:
+        for attempt in range(1, FILE_ATTEMPTS + 1):
+            path.unlink(missing_ok=True)  # Fresh attempt; never mix incomplete file versions.
+            print(f"curl原文件下载 {attempt}/{FILE_ATTEMPTS}，总时限{FILE_TIMEOUT}秒。", flush=True)
+            try:
+                result = subprocess.run(command, env=env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, timeout=FILE_TIMEOUT)
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                code = 28
+            if code == 0 and path.is_file():
+                return DiskReader(staging, path, path.stat().st_size)
+            print(f"原文件尝试{attempt}失败，curl退出码{code}。", flush=True)
+        raise DownloadFailure(code, FILE_ATTEMPTS)
+    except BaseException:
         staging.cleanup()
         raise
+
+
+def save_failures(path, source, failures):
+    data = {"source": source, "files": failures}
+    pending = path.with_suffix(".tmp")
+    pending.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    pending.replace(path)
+    return data
 
 
 class Release:
     def __init__(self, repo, tag):
         self.repo, self.tag, self.id = repo, tag, None
+        self.title = ""
 
     def command(self, *args):
         for attempt in range(3):
@@ -444,7 +279,7 @@ class Release:
         if (type(release.get("id")) is not int or release.get("draft") is not True
                 or release.get("tag_name") != self.tag):
             raise RuntimeError("创建Release草稿响应无效")
-        self.id = str(release["id"])
+        self.id, self.title = str(release["id"]), title
 
     def upload(self, path):
         # Retry replacement is limited to assets of this newly created draft.
@@ -458,8 +293,10 @@ class Release:
         if asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size:
             raise RuntimeError("Release附件状态或字节数不符")
 
-    def publish(self, notes):
-        self.command("release", "edit", self.tag, "--repo", self.repo, "--notes", notes, "--draft=false")
+    def publish(self, notes, incomplete=False):
+        title = self.title + (" · INCOMPLETE" if incomplete else "")
+        self.command("release", "edit", self.tag, "--repo", self.repo, "--notes", notes,
+                     "--title", title, f"--prerelease={str(incomplete).lower()}", "--draft=false")
 
 
 class PartWriter:
@@ -474,8 +311,8 @@ class PartWriter:
         return True
 
     def _start(self):
-        if len(self.assets) >= 999:
-            raise RuntimeError("达到999分卷上限，另保留一个manifest附件名额")
+        if len(self.assets) >= 998:
+            raise RuntimeError("达到998分卷上限，另保留manifest和失败清单附件名额")
         if shutil.disk_usage(self.directory).free < self.part_bytes + 128_000_000:
             raise RuntimeError("runner剩余磁盘不足一个分卷加128MB余量")
         self.path = self.directory / f"{self.stem}.part{len(self.assets) + 1:05d}"
@@ -533,8 +370,8 @@ def main():
     if limit < 0 or not 10 <= part_mb <= 1900:
         raise ValueError("MAX_POSTS须非负；PART_MB须在10–1900之间")
     compression = os.environ.get("COMPRESSION", "xz")
-    if compression not in ("xz", "gzip") or os.environ.get("LOG_LEVEL", "warn") not in ("warn", "error", "notice", "info", "debug"):
-        raise ValueError("压缩格式或日志级别无效")
+    if compression not in ("xz", "gzip"):
+        raise ValueError("压缩格式无效")
     user_agent()
     repo = os.environ["GITHUB_REPOSITORY"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not os.environ.get("GH_TOKEN"):
@@ -560,7 +397,8 @@ def main():
         extension = "xz" if compression == "xz" else "gz"
         stem = f"{service}-{user}.tar.{extension}"
         writer = PartWriter(temp, stem, part_mb * 1_000_000, release.upload)
-        files, seen = [], set()
+        files, failures, seen = [], [], set()
+        failure_path = Path(os.environ["RUNNER_TEMP"]) / "failed-files.json"
         try:
             compressor = (lzma.LZMAFile(writer, mode="w", preset=3) if compression == "xz"
                           else gzip.GzipFile(fileobj=writer, mode="wb", compresslevel=1, mtime=0))
@@ -578,8 +416,16 @@ def main():
                         for item in file_references(detail):
                             if item["path"] in seen:
                                 continue
-                            print(f"准备原文件{len(files) + 1}，节点{urllib.parse.urlsplit(item['url']).hostname}。", flush=True)
-                            media = open_media(item["url"], temp, writer.part_bytes)
+                            seen.add(item["path"])
+                            print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(item['url']).hostname}。", flush=True)
+                            try:
+                                media = open_media(item["url"], temp, writer.part_bytes)
+                            except DownloadFailure as error:
+                                failures.append({**item, "post_id": entry["id"], "attempts": error.attempts,
+                                                 "timeout_seconds": FILE_TIMEOUT, "exit_code": error.code})
+                                save_failures(failure_path, source, failures)
+                                print(f"::warning::原文件已记入失败清单；累计{len(failures)}个，继续归档。")
+                                continue
                             try:
                                 name = "media/" + item["path"].lstrip("/")
                                 info = tarfile.TarInfo(name)
@@ -588,26 +434,32 @@ def main():
                                 if media.offset != media.size:
                                     raise RuntimeError("媒体读取长度不符")
                                 files.append({**item, "archive_path": name, "bytes": media.size})
-                                seen.add(item["path"])
                             finally:
                                 media.close()
                         print(f"帖子{index}/{len(posts)}；已归档{len(files)}个不同原文件。", flush=True)
                     add_json(archive, "metadata/files.json", files)
+                    if failures:
+                        add_json(archive, "metadata/failed-files.json", {"source": source, "files": failures})
             writer.finish()
+            if failures:
+                release.upload(failure_path)
             manifest = {"source": source, "post_count": len(posts), "file_count": len(files),
                         "original_bytes": sum(f["bytes"] for f in files), "limited_run": bool(limit),
+                        "failed_file_count": len(failures), "media_complete": not failures,
+                        "complete": not limit and not failures,
                         "format": f"Concatenate all numbered parts in order, then extract tar.{extension}",
                         "part_bytes_max": part_mb * 1_000_000, "assets": writer.assets}
             path = Path(temp) / "archive-manifest.json"
             path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             release.upload(path)
-            notes = (f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(files)}; parts: {len(writer.assets)}.\n\n"
+            notes = ((f"**INCOMPLETE: {len(failures)} original files failed. See failed-files.json.**\n\n" if failures else "")
+                     + f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(files)}; parts: {len(writer.assets)}.\n\n"
                      + ("Limited sample run.\n\n" if limit else "")
                      + "Download every numbered part. Combine before extracting (Linux/macOS):\n\n"
                      + f"```sh\ncat {stem}.part* > {stem}\ntar -xf {stem}\n```\n\n"
                      + f"Windows: `copy /b {stem}.part* {stem}`, then extract with 7-Zip.\n\n"
                      + "External embeds are retained as references. No credentials or cookies are included.")
-            release.publish(notes)
+            release.publish(notes, incomplete=bool(failures))
             print(f"::notice::Release已发布：https://github.com/{repo}/releases/tag/{tag}")
         finally:
             writer.abort()
