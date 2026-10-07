@@ -133,12 +133,23 @@ jobs:
         uses: actions/checkout@main
         with:
           persist-credentials: false
-      - name: Install download tools
-        run: |
-          set -euo pipefail
 
-          sudo apt-get update -qq
-          sudo apt-get install -yqq aria2 ca-certificates curl xz-utils
+      - name: Install Tools
+        id: apt-download
+        working-directory: /
+        run: |
+          echo -e "Current working directory: $(pwd)"
+          ls -lh ./
+          echo -e "========== Checkin Container =========="
+          run_root() {
+            if command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              "$@"
+            fi
+          }
+          run_root apt-get -yqq update
+          run_root apt-get -yqq install aria2 ca-certificates curl xz-utils
           aria2c --version
           curl --version
           xz --version
