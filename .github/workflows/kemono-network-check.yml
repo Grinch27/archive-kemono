@@ -8,7 +8,11 @@ permissions:
   contents: read
 jobs:
   probe:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - name: Probe official nodes without downloading media
@@ -17,11 +21,16 @@ jobs:
           unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
           export NO_PROXY='*' no_proxy='*'
           path='/data/a5/16/a516d05ac9ea5a60ef1a8d33215d9f487c76f1624d1a5d44a45840063e0c67f2.jpg'
-          for host in kemono.cr n1.kemono.cr n2.kemono.cr n3.kemono.cr n4.kemono.cr img.kemono.cr; do
+          for host in kemono.cr n2.kemono.cr n3.kemono.cr kemono.su n2.kemono.su n3.kemono.su; do
             printf '\nNode: %s\n' "$host"
-            getent ahostsv4 "$host" | awk '!seen[$1]++ {print "IPv4:", $1}'
+            python3 -c 'import socket,sys; print("IPv4:", sorted({v[4][0] for v in socket.getaddrinfo(sys.argv[1],443,socket.AF_INET)}))' "$host" || true
             curl --disable --ipv4 --noproxy '*' --head --silent --show-error \
               --connect-timeout 5 --max-time 8 --output /dev/null \
               --write-out 'HTTP=%{http_code} IP=%{remote_ip} TYPE=%{content_type} TIME=%{time_total}\n' \
               "https://${host}${path}" || true
           done
+          printf '\nHTTP-only reachability test (HEAD, no media body):\n'
+          curl --disable --ipv4 --noproxy '*' --head --silent --show-error \
+            --connect-timeout 5 --max-time 8 --output /dev/null \
+            --write-out 'HTTP=%{http_code} IP=%{remote_ip} TYPE=%{content_type} TIME=%{time_total}\n' \
+            "http://n3.kemono.cr${path}" || true
