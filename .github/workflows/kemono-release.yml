@@ -1,6 +1,6 @@
 # 待确认：云端原文件可达性、总容量；后续研究：大作者跨运行恢复。
 # 潜在优化：分片并行；风险：运行会创建公开Release，失败保留草稿。
-# 验证重点：容器依赖齐全、push参数回退、runner直连、Cookie隔离、每卷低于2GB、缺文件时标记INCOMPLETE并保存清单。
+# 验证重点：媒体1次/3秒、Python只处理数据、工作流上传确认后继续分卷、失败不发布、每卷低于2GB。
 name: Kemono author to Release
 
 # GitHub Actions workflow syntax reference:
@@ -121,6 +121,9 @@ jobs:
       HTTPS_PROXY: ""
       ALL_PROXY: ""
       NO_PROXY: "*"
+      GH_REPO: ${{ github.repository }}
+      ARCHIVE_DIR: ${{ runner.temp }}/kemono-archive
+      CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/patreon/user/4068015' }}
     steps:
       - name: Install Tools
         id: apt-download
@@ -152,9 +155,27 @@ jobs:
       - name: Run offline regression tests
         run: python3 -m unittest discover -s tests -q -b
 
-      - name: Download, split and publish
+      - name: Create Release draft
         env:
-          CREATOR_URL: ${{ inputs.creator_url || 'https://kemono.cr/patreon/user/4068015' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CREATOR_URL" =~ ^https://kemono\.cr/([a-z0-9_-]+)/user/([A-Za-z0-9_-]+)/?$ ]]; then
+            echo '::error::作者URL无效'
+            exit 1
+          fi
+          service=${BASH_REMATCH[1]}
+          user=${BASH_REMATCH[2]}
+          tag="kemono-$service-$user-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          release_id=$(gh api --method POST "repos/$GH_REPO/releases" \
+            -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+            -F draft=true -f name="$service/$user" --jq '.id')
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          printf 'RELEASE_TAG=%s\nRELEASE_ID=%s\n' "$tag" "$release_id" >> "$GITHUB_ENV"
+
+      - name: Process archive and upload ready parts
+        id: archive
+        env:
           MAX_POSTS: ${{ inputs.max_posts || '0' }}
           PART_MB: ${{ inputs.part_mb || '1800' }}
           COMPRESSION: ${{ inputs.compression || 'xz' }}
@@ -166,9 +187,55 @@ jobs:
           set -euo pipefail
           unset http_proxy https_proxy all_proxy no_proxy
           export no_proxy='*'
-          command -v python3
-          command -v gh
-          python3 scripts/kemono_release.py
+          # Python has no GitHub token; acknowledge each part only after upload verification.
+          coproc ARCHIVER { env -u GH_TOKEN -u GITHUB_TOKEN python3 -u scripts/kemono_release.py; }
+          archive_pid=$ARCHIVER_PID
+          exec 3<&"${ARCHIVER[0]}" 4>&"${ARCHIVER[1]}"
+          trap 'kill "$archive_pid" 2>/dev/null || true' EXIT
+          while IFS= read -r line <&3; do
+            if [[ "$line" == ARCHIVE_PART=* ]]; then
+              name=${line#ARCHIVE_PART=}
+              [[ "$name" =~ ^[a-z0-9_-]+-[A-Za-z0-9_-]+\.tar\.(xz|gz)\.part[0-9]{5}$ ]]
+              path="$ARCHIVE_DIR/$name"
+              size=$(stat -c %s "$path")
+              (( size > 0 && size < 2000000000 ))
+              gh release upload "$RELEASE_TAG" "$path" --clobber
+              state=$(gh api "repos/$GH_REPO/releases/$RELEASE_ID/assets" --paginate \
+                --jq ".[] | select(.name == \"$name\") | \"\\(.state):\\(.size)\"")
+              [[ "$state" == "uploaded:$size" ]]
+              printf '%s\n' "$name" >&4
+            else
+              printf '%s\n' "$line"
+            fi
+          done
+          wait "$archive_pid"
+          exec 3<&- 4>&-
+          trap - EXIT
+
+      - name: Upload metadata and publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TITLE: ${{ steps.archive.outputs.title }}
+          INCOMPLETE: ${{ steps.archive.outputs.incomplete }}
+        run: |
+          set -euo pipefail
+          assets=("$ARCHIVE_DIR/archive-manifest.json")
+          if [[ -f "$RUNNER_TEMP/failed-files.json" ]]; then
+            assets+=("$RUNNER_TEMP/failed-files.json")
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          for path in "${assets[@]}"; do
+            name=${path##*/}
+            size=$(stat -c %s "$path")
+            state=$(gh api "repos/$GH_REPO/releases/$RELEASE_ID/assets" --paginate \
+              --jq ".[] | select(.name == \"$name\") | \"\\(.state):\\(.size)\"")
+            [[ "$state" == "uploaded:$size" ]]
+          done
+          [[ -n "$RELEASE_TITLE" && "$INCOMPLETE" =~ ^(true|false)$ ]]
+          gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" \
+            --notes-file "$ARCHIVE_DIR/release-notes.md" \
+            --prerelease="$INCOMPLETE" --draft=false
+          echo "::notice::Release已发布：https://github.com/$GH_REPO/releases/tag/$RELEASE_TAG"
 
       - name: Preserve failed-file list
         if: always()

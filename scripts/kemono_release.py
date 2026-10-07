@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# 待确认：云端登录与原文件可达性、作者总容量；只在GitHub Actions执行下载和发布。
+# 待确认：云端登录与原文件可达性、作者总容量；只在GitHub Actions下载；Release由工作流处理。
 # 后续研究：按失败清单补下；潜在优化：并行详情预取。
-# 风险：每次下载限10秒，大文件可能失败；回退预览不是原图，缺原文件仍标记部分归档。
-# 验证重点：直连、Cookie隔离、每地址1次/10秒、预览格式与标记、失败清单、tar可解压、分卷<2GB。
+# 风险：每次下载限3秒，大文件可能失败；回退预览不是原图，缺原文件仍标记部分归档。
+# 验证重点：直连、Cookie隔离、每地址1次/3秒、预览格式与标记、失败清单、tar可解压、分卷<2GB。
 
 import gzip
 import http.cookiejar
@@ -27,7 +27,7 @@ BASE = "https://kemono.cr"
 PART_MAX = 1_900_000_000  # Also below decimal 2GB, not just GitHub's 2GiB.
 TRANSIENT = {429, 500, 502, 503, 504}
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7194.92 Safari/537.36"
-FILE_ATTEMPTS, FILE_TIMEOUT = 1, 10
+FILE_ATTEMPTS, FILE_TIMEOUT = 1, 3
 
 
 def user_agent():
@@ -259,61 +259,18 @@ def save_failures(path, source, failures):
     return data
 
 
-class Release:
-    def __init__(self, repo, tag):
-        self.repo, self.tag, self.id = repo, tag, None
-        self.title = ""
-
-    def command(self, *args):
-        for attempt in range(3):
-            result = subprocess.run(["gh", *args], capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout
-            if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
-        status = re.search(r"HTTP (\d{3})", result.stderr or "")
-        detail = f"HTTP {status.group(1)}" if status else f"exit {result.returncode}"
-        raise RuntimeError(f"GitHub {args[0]}操作失败：{detail}；检查权限和网络")
-
-    def create(self, title):
-        # Each run has a new tag. Do not reuse or overwrite an existing Release.
-        payload = {"tag_name": self.tag, "target_commitish": os.environ["GITHUB_SHA"],
-                   "draft": True, "name": title, "body": "归档正在生成；草稿可能不完整。"}
-        result = subprocess.run(["gh", "api", "--method", "POST", f"repos/{self.repo}/releases", "--input", "-"],
-                                input=json.dumps(payload), capture_output=True, text=True)
-        if result.returncode:
-            status = re.search(r"HTTP (\d{3})", result.stderr or "")
-            detail = f"HTTP {status.group(1)}" if status else f"exit {result.returncode}"
-            raise RuntimeError(f"创建Release草稿失败：{detail}；未下载原文件")
-        release = json.loads(result.stdout)
-        if (type(release.get("id")) is not int or release.get("draft") is not True
-                or release.get("tag_name") != self.tag):
-            raise RuntimeError("创建Release草稿响应无效")
-        self.id, self.title = str(release["id"]), title
-
-    def upload(self, path):
-        # Retry replacement is limited to assets of this newly created draft.
-        if path.stat().st_size >= 2_000_000_000:
-            raise RuntimeError("Release附件达到2GB，拒绝上传")
-        self.command("release", "upload", self.tag, str(path), "--repo", self.repo, "--clobber")
-        query = f'.[] | select(.name == {json.dumps(path.name)}) | {{size,state}}'
-        raw = self.command("api", f"repos/{self.repo}/releases/{self.id}/assets",
-                           "--paginate", "--jq", query)
-        asset = json.loads(raw)
-        if asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size:
-            raise RuntimeError("Release附件状态或字节数不符")
-
-    def publish(self, notes, incomplete=False):
-        title = self.title + (" · INCOMPLETE" if incomplete else "")
-        self.command("release", "edit", self.tag, "--repo", self.repo, "--notes", notes,
-                     "--title", title, f"--prerelease={str(incomplete).lower()}", "--draft=false")
+def handoff(path):
+    # Workflow uploads and verifies this closed file before acknowledging its name.
+    print("ARCHIVE_PART=" + path.name, flush=True)
+    if sys.stdin.readline().strip() != path.name:
+        raise RuntimeError("工作流未确认分卷上传；停止归档")
 
 
 class PartWriter:
-    def __init__(self, directory, stem, part_bytes, upload):
+    def __init__(self, directory, stem, part_bytes, ready):
         if not 1 <= part_bytes <= PART_MAX:
             raise ValueError("分卷超过安全上限")
-        self.directory, self.stem, self.part_bytes, self.upload = Path(directory), stem, part_bytes, upload
+        self.directory, self.stem, self.part_bytes, self.ready = Path(directory), stem, part_bytes, ready
         self.file, self.path, self.size = None, None, 0
         self.assets = []
 
@@ -346,10 +303,10 @@ class PartWriter:
     def _finish_part(self):
         self.file.close()
         self.file = None
-        self.upload(self.path)
+        self.ready(self.path)
         self.assets.append({"name": self.path.name, "bytes": self.size})
         self.path.unlink()  # Only remove this run's temporary chunk after upload.
-        print(f"已上传分卷{len(self.assets)}：{self.size}字节", flush=True)
+        print(f"分卷{len(self.assets)}已由工作流确认：{self.size}字节", flush=True)
 
     def finish(self):
         if self.file is not None:
@@ -370,7 +327,7 @@ def add_json(archive, name, value):
 
 def main():
     if os.environ.get("GITHUB_ACTIONS") != "true":
-        raise RuntimeError("原文件下载和Release发布仅允许在GitHub Actions运行")
+        raise RuntimeError("媒体下载仅允许在GitHub Actions运行")
     source = os.environ.get("CREATOR_URL", BASE + "/patreon/user/4068015")
     service, user = creator_parts(source)
     try:
@@ -383,12 +340,6 @@ def main():
     if compression not in ("xz", "gzip"):
         raise ValueError("压缩格式无效")
     user_agent()
-    repo = os.environ["GITHUB_REPOSITORY"]
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not os.environ.get("GH_TOKEN"):
-        raise RuntimeError("GitHub仓库或token配置无效")
-    run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
-    if not run.isdigit() or not attempt.isdigit():
-        raise RuntimeError("运行标识无效")
     api = Api()
     api.login()
     profile = api.get(f"/{service}/user/{user}/profile")
@@ -399,101 +350,100 @@ def main():
         raise RuntimeError("没有可归档帖子")
     if not limit and profile.get("post_count") != len(posts):
         raise RuntimeError("分页数量与profile不符，可能更新中；停止而不声明完整")
-    tag = f"kemono-{service}-{user}-{run}-{attempt}"
-    release = Release(repo, tag)
-    release.create(f"{service}/{user} · {len(posts)} posts" + (" · sample" if limit else ""))
-    print(f"Release草稿已创建：{tag}；准备{len(posts)}条帖子。", flush=True)
-    with tempfile.TemporaryDirectory(prefix="kemono-release-", dir=os.environ["RUNNER_TEMP"]) as temp:
-        extension = "xz" if compression == "xz" else "gz"
-        stem = f"{service}-{user}.tar.{extension}"
-        writer = PartWriter(temp, stem, part_mb * 1_000_000, release.upload)
-        files, failures, seen = [], [], set()
-        failure_path = Path(os.environ["RUNNER_TEMP"]) / "failed-files.json"
-        try:
-            compressor = (lzma.LZMAFile(writer, mode="w", preset=3) if compression == "xz"
-                          else gzip.GzipFile(fileobj=writer, mode="wb", compresslevel=1, mtime=0))
-            with compressor as compressed:
-                with tarfile.open(fileobj=compressed, mode="w|") as archive:
-                    add_json(archive, "metadata/profile.json", profile)
-                    add_json(archive, "metadata/posts.json", posts)
-                    for index, entry in enumerate(posts, 1):
-                        print(f"读取帖子详情{index}/{len(posts)}。", flush=True)
-                        detail = api.get(f"/{service}/user/{user}/post/{entry['id']}")
-                        post = detail.get("post") if isinstance(detail, dict) else None
-                        if not isinstance(post, dict) or (post.get("service"), post.get("user"), post.get("id")) != (service, user, entry["id"]):
-                            raise RuntimeError("详情帖子标识不符")
-                        add_json(archive, f"posts/{entry['id']}.json", detail)
-                        for item in file_references(detail):
-                            if item["path"] in seen:
+    print(f"准备归档{len(posts)}条帖子。", flush=True)
+    temp = Path(os.environ["RUNNER_TEMP"]) / "kemono-archive"
+    temp.mkdir(exist_ok=False)
+    extension = "xz" if compression == "xz" else "gz"
+    stem = f"{service}-{user}.tar.{extension}"
+    writer = PartWriter(temp, stem, part_mb * 1_000_000, handoff)
+    files, failures, seen = [], [], set()
+    failure_path = Path(os.environ["RUNNER_TEMP"]) / "failed-files.json"
+    try:
+        compressor = (lzma.LZMAFile(writer, mode="w", preset=3) if compression == "xz"
+                      else gzip.GzipFile(fileobj=writer, mode="wb", compresslevel=1, mtime=0))
+        with compressor as compressed:
+            with tarfile.open(fileobj=compressed, mode="w|") as archive:
+                add_json(archive, "metadata/profile.json", profile)
+                add_json(archive, "metadata/posts.json", posts)
+                for index, entry in enumerate(posts, 1):
+                    print(f"读取帖子详情{index}/{len(posts)}。", flush=True)
+                    detail = api.get(f"/{service}/user/{user}/post/{entry['id']}")
+                    post = detail.get("post") if isinstance(detail, dict) else None
+                    if not isinstance(post, dict) or (post.get("service"), post.get("user"), post.get("id")) != (service, user, entry["id"]):
+                        raise RuntimeError("详情帖子标识不符")
+                    add_json(archive, f"posts/{entry['id']}.json", detail)
+                    for item in file_references(detail):
+                        if item["path"] in seen:
+                            continue
+                        seen.add(item["path"])
+                        kind, download_url = "original", item["url"]
+                        print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(download_url or '').hostname}。", flush=True)
+                        try:
+                            if not download_url:
+                                raise DownloadFailure(0, 0)
+                            media = open_media(download_url, temp, writer.part_bytes)
+                        except DownloadFailure as error:
+                            failure = {**item, "post_id": entry["id"], "attempts": error.attempts,
+                                       "timeout_seconds": FILE_TIMEOUT, "exit_code": error.code,
+                                       "reason": "missing_media_node" if not download_url else "download_failed"}
+                            failures.append(failure)
+                            save_failures(failure_path, source, failures)
+                            if not item["preview_url"]:
                                 continue
-                            seen.add(item["path"])
-                            kind, download_url = "original", item["url"]
-                            print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(download_url or '').hostname}。", flush=True)
+                            kind, download_url = "preview", item["preview_url"]
                             try:
-                                if not download_url:
-                                    raise DownloadFailure(0, 0)
-                                media = open_media(download_url, temp, writer.part_bytes)
-                            except DownloadFailure as error:
-                                failure = {**item, "post_id": entry["id"], "attempts": error.attempts,
-                                           "timeout_seconds": FILE_TIMEOUT, "exit_code": error.code,
-                                           "reason": "missing_media_node" if not download_url else "download_failed"}
-                                failures.append(failure)
+                                media = open_media(download_url, temp, writer.part_bytes, image_only=True)
+                            except DownloadFailure as preview_error:
+                                failure["preview_failure"] = {"exit_code": preview_error.code, "attempts": preview_error.attempts}
                                 save_failures(failure_path, source, failures)
-                                if not item["preview_url"]:
-                                    continue
-                                kind, download_url = "preview", item["preview_url"]
-                                try:
-                                    media = open_media(download_url, temp, writer.part_bytes, image_only=True)
-                                except DownloadFailure as preview_error:
-                                    failure["preview_failure"] = {"exit_code": preview_error.code, "attempts": preview_error.attempts}
-                                    save_failures(failure_path, source, failures)
-                                    continue
-                            try:
-                                name = ("media/" if kind == "original" else "previews/") + item["path"].lstrip("/")
-                                info = tarfile.TarInfo(name)
-                                info.size, info.mode, info.mtime = media.size, 0o644, 0
-                                archive.addfile(info, media)
-                                if media.offset != media.size:
-                                    raise RuntimeError("媒体读取长度不符")
-                                files.append({**item, "kind": kind, "download_url": download_url,
-                                              "archive_path": name, "bytes": media.size})
-                                if kind == "preview":
-                                    failure["preview_archive_path"] = name
-                                    save_failures(failure_path, source, failures)
-                            finally:
-                                media.close()
-                        print(f"帖子{index}/{len(posts)}；已归档{len(files)}个文件（含预览），缺原文件{len(failures)}个。", flush=True)
-                    add_json(archive, "metadata/files.json", files)
-                    if failures:
-                        add_json(archive, "metadata/failed-files.json", {"source": source, "files": failures})
-            writer.finish()
-            if failures:
-                release.upload(failure_path)
-            originals = [f for f in files if f["kind"] == "original"]
-            previews = [f for f in files if f["kind"] == "preview"]
-            manifest = {"source": source, "post_count": len(posts), "file_count": len(files),
-                        "original_file_count": len(originals), "preview_file_count": len(previews),
-                        "original_bytes": sum(f["bytes"] for f in originals),
-                        "preview_bytes": sum(f["bytes"] for f in previews), "limited_run": bool(limit),
-                        "failed_file_count": len(failures), "media_complete": not failures,
-                        "complete": not limit and not failures,
-                        "format": f"Concatenate all numbered parts in order, then extract tar.{extension}",
-                        "part_bytes_max": part_mb * 1_000_000, "assets": writer.assets}
-            path = Path(temp) / "archive-manifest.json"
-            path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            release.upload(path)
-            notes = ((f"**INCOMPLETE: {len(failures)} original files failed. See failed-files.json.**\n\n" if failures else "")
-                     + f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(originals)}; preview substitutes: {len(previews)}; parts: {len(writer.assets)}.\n\n"
-                     + "Preview substitutes are stored under previews/; they are not original quality.\n\n"
-                     + ("Limited sample run.\n\n" if limit else "")
-                     + "Download every numbered part. Combine before extracting (Linux/macOS):\n\n"
-                     + f"```sh\ncat {stem}.part* > {stem}\ntar -xf {stem}\n```\n\n"
-                     + f"Windows: `copy /b {stem}.part* {stem}`, then extract with 7-Zip.\n\n"
-                     + "External embeds are retained as references. No credentials or cookies are included.")
-            release.publish(notes, incomplete=bool(failures))
-            print(f"::notice::Release已发布：https://github.com/{repo}/releases/tag/{tag}")
-        finally:
-            writer.abort()
+                                continue
+                        try:
+                            name = ("media/" if kind == "original" else "previews/") + item["path"].lstrip("/")
+                            info = tarfile.TarInfo(name)
+                            info.size, info.mode, info.mtime = media.size, 0o644, 0
+                            archive.addfile(info, media)
+                            if media.offset != media.size:
+                                raise RuntimeError("媒体读取长度不符")
+                            files.append({**item, "kind": kind, "download_url": download_url,
+                                          "archive_path": name, "bytes": media.size})
+                            if kind == "preview":
+                                failure["preview_archive_path"] = name
+                                save_failures(failure_path, source, failures)
+                        finally:
+                            media.close()
+                    print(f"帖子{index}/{len(posts)}；已归档{len(files)}个文件（含预览），缺原文件{len(failures)}个。", flush=True)
+                add_json(archive, "metadata/files.json", files)
+                if failures:
+                    add_json(archive, "metadata/failed-files.json", {"source": source, "files": failures})
+        writer.finish()
+        originals = [f for f in files if f["kind"] == "original"]
+        previews = [f for f in files if f["kind"] == "preview"]
+        manifest = {"source": source, "post_count": len(posts), "file_count": len(files),
+                    "original_file_count": len(originals), "preview_file_count": len(previews),
+                    "original_bytes": sum(f["bytes"] for f in originals),
+                    "preview_bytes": sum(f["bytes"] for f in previews), "limited_run": bool(limit),
+                    "failed_file_count": len(failures), "media_complete": not failures,
+                    "complete": not limit and not failures,
+                    "format": f"Concatenate all numbered parts in order, then extract tar.{extension}",
+                    "part_bytes_max": part_mb * 1_000_000, "assets": writer.assets}
+        path = Path(temp) / "archive-manifest.json"
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        notes = ((f"**INCOMPLETE: {len(failures)} original files failed. See failed-files.json.**\n\n" if failures else "")
+                 + f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(originals)}; preview substitutes: {len(previews)}; parts: {len(writer.assets)}.\n\n"
+                 + "Preview substitutes are stored under previews/; they are not original quality.\n\n"
+                 + ("Limited sample run.\n\n" if limit else "")
+                 + "Download every numbered part. Combine before extracting (Linux/macOS):\n\n"
+                 + f"```sh\ncat {stem}.part* > {stem}\ntar -xf {stem}\n```\n\n"
+                 + f"Windows: `copy /b {stem}.part* {stem}`, then extract with 7-Zip.\n\n"
+                 + "External embeds are retained as references. No credentials or cookies are included.")
+        (temp / "release-notes.md").write_text(notes + "\n", encoding="utf-8")
+        title = f"{service}/{user} · {len(posts)} posts" + (" · sample" if limit else "")
+        title += " · INCOMPLETE" if failures else ""
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"title={title}\nincomplete={str(bool(failures)).lower()}\n")
+        print("归档处理完成；工作流负责上传清单和发布Release。", flush=True)
+    finally:
+        writer.abort()
 
 
 if __name__ == "__main__":
@@ -505,5 +455,5 @@ if __name__ == "__main__":
             print("::error::" + str(error).replace("\n", " ").replace("\r", " "), file=sys.stderr)
         else:
             print("::error::归档失败：" + type(error).__name__, file=sys.stderr)
-        print("未完成归档的Release保持草稿；若失败发生在发布请求中，请核对远端状态。", file=sys.stderr)
+        print("归档处理失败；工作流应保留Release草稿和失败清单。", file=sys.stderr)
         sys.exit(1)
