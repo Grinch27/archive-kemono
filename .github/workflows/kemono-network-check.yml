@@ -34,3 +34,9 @@ jobs:
             --connect-timeout 5 --max-time 8 --output /dev/null \
             --write-out 'HTTP=%{http_code} IP=%{remote_ip} TYPE=%{content_type} TIME=%{time_total}\n' \
             "http://n3.kemono.cr${path}" || true
+          printf '\nIPv6-only HTTPS reachability test (HEAD):\n'
+          python3 -c 'import socket; print("IPv6:", sorted({v[4][0] for v in socket.getaddrinfo("n3.kemono.cr",443,socket.AF_INET6)}))' || true
+          curl --disable --ipv6 --noproxy '*' --head --silent --show-error \
+            --connect-timeout 5 --max-time 8 --output /dev/null \
+            --write-out 'HTTP=%{http_code} IP=%{remote_ip} TYPE=%{content_type} TIME=%{time_total}\n' \
+            "https://n3.kemono.cr${path}" || true
