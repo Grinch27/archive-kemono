@@ -172,7 +172,7 @@ jobs:
 
       - name: Preserve failed-file list
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@main # v4.6.2
         with:
           name: failed-files-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/failed-files.json
