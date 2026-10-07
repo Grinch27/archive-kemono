@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # 待确认：云端登录与原文件可达性、作者总容量；只在GitHub Actions执行下载和发布。
 # 后续研究：按失败清单补下；潜在优化：并行详情预取。
-# 风险：每次完整下载限30秒，大文件可能失败；缺文件时发布明确标记的部分归档。
-# 验证重点：直连、Cookie隔离、每文件最多3次、失败清单持久化、tar可解压、分卷<2GB；不算SHA256。
+# 风险：每次下载限10秒，大文件可能失败；回退预览不是原图，缺原文件仍标记部分归档。
+# 验证重点：直连、Cookie隔离、每地址1次/10秒、预览格式与标记、失败清单、tar可解压、分卷<2GB。
 
 import gzip
 import http.cookiejar
@@ -27,7 +27,7 @@ BASE = "https://kemono.cr"
 PART_MAX = 1_900_000_000  # Also below decimal 2GB, not just GitHub's 2GiB.
 TRANSIENT = {429, 500, 502, 503, 504}
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7194.92 Safari/537.36"
-FILE_ATTEMPTS, FILE_TIMEOUT = 3, 30
+FILE_ATTEMPTS, FILE_TIMEOUT = 1, 10
 
 
 def user_agent():
@@ -88,6 +88,8 @@ def canonical_path(path):
 def file_references(detail):
     post = detail["post"]
     resolved = {}
+    thumbnails = {canonical_path(p["path"]) for p in detail.get("previews") or []
+                  if isinstance(p, dict) and p.get("path") and p.get("type") == "thumbnail"}
     for item in [*(detail.get("attachments") or []), *(detail.get("previews") or []), *(detail.get("videos") or [])]:
         if isinstance(item, dict) and item.get("path") and item.get("server"):
             resolved[canonical_path(item["path"])] = item["server"]
@@ -99,13 +101,14 @@ def file_references(detail):
             continue
         path = canonical_path(item["path"])
         server = item.get("server") or resolved.get(path)
-        if not server or not media_host(server):
-            raise RuntimeError("原文件缺少可信下载节点")
-        p = urllib.parse.urlsplit(server)
-        if p.path not in ("", "/") or p.query or p.fragment:
-            raise RuntimeError("下载节点不是可信基址")
+        if server:
+            p = urllib.parse.urlsplit(server)
+            if not media_host(server) or p.path not in ("", "/") or p.query or p.fragment:
+                raise RuntimeError("下载节点不是可信基址")
+        quoted = urllib.parse.quote(path, safe="/")
         result[path] = {"path": path, "name": item.get("name"),
-                        "url": server.rstrip("/") + "/data" + urllib.parse.quote(path, safe="/")}
+                        "url": server.rstrip("/") + "/data" + quoted if server else None,
+                        "preview_url": "https://img.kemono.cr/thumbnail/data" + quoted if path in thumbnails else None}
     return list(result.values())
 
 
@@ -208,7 +211,7 @@ class DownloadFailure(RuntimeError):
         super().__init__(f"curl exit {code}; {attempts} attempts exhausted")
 
 
-def open_media(url, directory, part_bytes):
+def open_media(url, directory, part_bytes, image_only=False):
     if not media_host(url):
         raise ValueError("非官方下载地址")
     budget = shutil.disk_usage(directory).free - part_bytes - 256_000_000
@@ -225,7 +228,7 @@ def open_media(url, directory, part_bytes):
     try:
         for attempt in range(1, FILE_ATTEMPTS + 1):
             path.unlink(missing_ok=True)  # Fresh attempt; never mix incomplete file versions.
-            print(f"curl原文件下载 {attempt}/{FILE_ATTEMPTS}，总时限{FILE_TIMEOUT}秒。", flush=True)
+            print(f"curl{'预览' if image_only else '原文件'}下载 {attempt}/{FILE_ATTEMPTS}，总时限{FILE_TIMEOUT}秒。", flush=True)
             try:
                 result = subprocess.run(command, env=env, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE, timeout=FILE_TIMEOUT)
@@ -233,8 +236,15 @@ def open_media(url, directory, part_bytes):
             except subprocess.TimeoutExpired:
                 code = 28
             if code == 0 and path.is_file():
+                if image_only:
+                    with path.open("rb") as image:
+                        head = image.read(16)
+                    if not (head.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a"))
+                            or head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+                            or head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis")):
+                        raise DownloadFailure(65, attempt)  # Reject HTML/error pages returned with HTTP 200.
                 return DiskReader(staging, path, path.stat().st_size)
-            print(f"原文件尝试{attempt}失败，curl退出码{code}。", flush=True)
+            print(f"下载尝试{attempt}失败，curl退出码{code}。", flush=True)
         raise DownloadFailure(code, FILE_ATTEMPTS)
     except BaseException:
         staging.cleanup()
@@ -417,34 +427,54 @@ def main():
                             if item["path"] in seen:
                                 continue
                             seen.add(item["path"])
-                            print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(item['url']).hostname}。", flush=True)
+                            kind, download_url = "original", item["url"]
+                            print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(download_url or '').hostname}。", flush=True)
                             try:
-                                media = open_media(item["url"], temp, writer.part_bytes)
+                                if not download_url:
+                                    raise DownloadFailure(0, 0)
+                                media = open_media(download_url, temp, writer.part_bytes)
                             except DownloadFailure as error:
-                                failures.append({**item, "post_id": entry["id"], "attempts": error.attempts,
-                                                 "timeout_seconds": FILE_TIMEOUT, "exit_code": error.code})
+                                failure = {**item, "post_id": entry["id"], "attempts": error.attempts,
+                                           "timeout_seconds": FILE_TIMEOUT, "exit_code": error.code,
+                                           "reason": "missing_media_node" if not download_url else "download_failed"}
+                                failures.append(failure)
                                 save_failures(failure_path, source, failures)
-                                print(f"::warning::原文件已记入失败清单；累计{len(failures)}个，继续归档。")
-                                continue
+                                if not item["preview_url"]:
+                                    continue
+                                kind, download_url = "preview", item["preview_url"]
+                                try:
+                                    media = open_media(download_url, temp, writer.part_bytes, image_only=True)
+                                except DownloadFailure as preview_error:
+                                    failure["preview_failure"] = {"exit_code": preview_error.code, "attempts": preview_error.attempts}
+                                    save_failures(failure_path, source, failures)
+                                    continue
                             try:
-                                name = "media/" + item["path"].lstrip("/")
+                                name = ("media/" if kind == "original" else "previews/") + item["path"].lstrip("/")
                                 info = tarfile.TarInfo(name)
                                 info.size, info.mode, info.mtime = media.size, 0o644, 0
                                 archive.addfile(info, media)
                                 if media.offset != media.size:
                                     raise RuntimeError("媒体读取长度不符")
-                                files.append({**item, "archive_path": name, "bytes": media.size})
+                                files.append({**item, "kind": kind, "download_url": download_url,
+                                              "archive_path": name, "bytes": media.size})
+                                if kind == "preview":
+                                    failure["preview_archive_path"] = name
+                                    save_failures(failure_path, source, failures)
                             finally:
                                 media.close()
-                        print(f"帖子{index}/{len(posts)}；已归档{len(files)}个不同原文件。", flush=True)
+                        print(f"帖子{index}/{len(posts)}；已归档{len(files)}个文件（含预览），缺原文件{len(failures)}个。", flush=True)
                     add_json(archive, "metadata/files.json", files)
                     if failures:
                         add_json(archive, "metadata/failed-files.json", {"source": source, "files": failures})
             writer.finish()
             if failures:
                 release.upload(failure_path)
+            originals = [f for f in files if f["kind"] == "original"]
+            previews = [f for f in files if f["kind"] == "preview"]
             manifest = {"source": source, "post_count": len(posts), "file_count": len(files),
-                        "original_bytes": sum(f["bytes"] for f in files), "limited_run": bool(limit),
+                        "original_file_count": len(originals), "preview_file_count": len(previews),
+                        "original_bytes": sum(f["bytes"] for f in originals),
+                        "preview_bytes": sum(f["bytes"] for f in previews), "limited_run": bool(limit),
                         "failed_file_count": len(failures), "media_complete": not failures,
                         "complete": not limit and not failures,
                         "format": f"Concatenate all numbered parts in order, then extract tar.{extension}",
@@ -453,7 +483,8 @@ def main():
             path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             release.upload(path)
             notes = ((f"**INCOMPLETE: {len(failures)} original files failed. See failed-files.json.**\n\n" if failures else "")
-                     + f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(files)}; parts: {len(writer.assets)}.\n\n"
+                     + f"Source: {source}\n\nPosts: {len(posts)}; original files: {len(originals)}; preview substitutes: {len(previews)}; parts: {len(writer.assets)}.\n\n"
+                     + "Preview substitutes are stored under previews/; they are not original quality.\n\n"
                      + ("Limited sample run.\n\n" if limit else "")
                      + "Download every numbered part. Combine before extracting (Linux/macOS):\n\n"
                      + f"```sh\ncat {stem}.part* > {stem}\ntar -xf {stem}\n```\n\n"

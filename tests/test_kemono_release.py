@@ -1,6 +1,6 @@
 # 待确认：真实API/runner行为；后续研究：云端小样本；潜在优化：更多服务样本。
 # 风险：所有API、媒体及Release均模拟，不能据此宣称真实下载成功。
-# 验证重点：3次/30秒、失败去重和持久化、部分归档可解压、分卷重组、上传失败不发布；本地不下载媒体。
+# 验证重点：1次/10秒与预览回退、失败去重和持久化、部分归档可解压、分卷重组、上传失败不发布；本地不下载媒体。
 import gzip
 import importlib.util
 import io
@@ -146,8 +146,8 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             def download(command, **kwargs):
                 self.assertEqual(command[0], "curl")
-                self.assertEqual(kwargs["timeout"], 30)
-                self.assertEqual(command[command.index("--max-time") + 1], "30")
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(command[command.index("--max-time") + 1], "10")
                 self.assertEqual(command[command.index("--retry") + 1], "0")
                 self.assertEqual(command[command.index("--noproxy") + 1], "*")
                 self.assertNotIn("KEMONO_PASSWORD", kwargs["env"])
@@ -156,29 +156,29 @@ class ArchiveTests(unittest.TestCase):
                 target = Path(command[command.index("--output") + 1])
                 self.assertFalse(target.exists())
                 target.write_bytes(b"partial")
-                raise subprocess.TimeoutExpired(command, 30)
+                raise subprocess.TimeoutExpired(command, 10)
             with patch.dict(os.environ, {"KEMONO_PASSWORD":"fixture", "GH_TOKEN":"fixture"}), patch.object(app.subprocess, "run", side_effect=download) as run:
                 with self.assertRaises(app.DownloadFailure) as failure:
                     app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
-                self.assertEqual(run.call_count, 3)
-                self.assertEqual((failure.exception.code, failure.exception.attempts), (28, 3))
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual((failure.exception.code, failure.exception.attempts), (28, 1))
             self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_file_retry_success_stops_early(self):
+    def test_file_success_needs_one_attempt(self):
         with tempfile.TemporaryDirectory() as temp:
             attempts = []
             def download(command, **kwargs):
                 target = Path(command[command.index("--output") + 1])
                 self.assertFalse(target.exists())
                 attempts.append(1)
-                target.write_bytes(b"original" if len(attempts) == 2 else b"partial")
-                return SimpleNamespace(returncode=0 if len(attempts) == 2 else 28)
+                target.write_bytes(b"original")
+                return SimpleNamespace(returncode=0)
             with patch.object(app.subprocess, "run", side_effect=download):
                 reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
                 self.assertEqual(reader.read(), b"original")
                 self.assertEqual(reader.offset, reader.size)
                 reader.close()
-            self.assertEqual(len(attempts), 2)
+            self.assertEqual(len(attempts), 1)
             self.assertEqual(list(Path(temp).iterdir()), [])
 
     def test_disk_budget_prevents_download(self):
@@ -215,7 +215,37 @@ class ArchiveTests(unittest.TestCase):
     def test_failure_list_survives_archive_upload_error(self):
         self.exercise_main(fail=True, upload_error=True)
 
-    def exercise_main(self, fail, compression="xz", upload_error=False):
+    def test_preview_fallback_is_archived_without_claiming_original_success(self):
+        self.exercise_main(fail=True, fallback=True)
+
+    def test_failed_preview_does_not_stop_later_files(self):
+        self.exercise_main(fail=True, fallback=False)
+
+    def test_missing_node_still_tries_preview(self):
+        self.exercise_main(fail=True, fallback=True, missing_node=True)
+
+    def test_original_success_does_not_download_preview(self):
+        self.exercise_main(fail=False, fallback=True)
+
+    def test_preview_rejects_html_and_accepts_image_header(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for payload, valid in [(b"<html>bad gateway</html>", False), (b"\xff\xd8\xfffixture", True)]:
+                def download(command, **kwargs):
+                    Path(command[command.index("--output") + 1]).write_bytes(payload)
+                    return SimpleNamespace(returncode=0)
+                with patch.object(app.subprocess, "run", side_effect=download) as run:
+                    if valid:
+                        reader = app.open_media("https://img.kemono.cr/thumbnail/data/a/file.jpg", temp, 10, image_only=True)
+                        self.assertEqual(reader.read(), payload)
+                        reader.close()
+                    else:
+                        with self.assertRaises(app.DownloadFailure) as error:
+                            app.open_media("https://img.kemono.cr/thumbnail/data/a/file.jpg", temp, 10, image_only=True)
+                        self.assertEqual(error.exception.code, 65)
+                    self.assertEqual(run.call_count, 1)
+                self.assertEqual(list(Path(temp).iterdir()), [])
+
+    def exercise_main(self, fail, compression="xz", upload_error=False, fallback=None, missing_node=False):
         events, assets, calls, published = [], {}, [], []
         class Api:
             def login(self): pass
@@ -226,7 +256,8 @@ class ArchiveTests(unittest.TestCase):
                 number = int(path.rsplit("/", 1)[1])
                 return {"post": {**post(number), "content": "fixture body", "file": {"path": "/a/file.bin"},
                                  "attachments": [{"path":"/a/later.bin", "server":"https://n1.kemono.cr"}] if number == 2 else []},
-                        "previews": [{"path":"/a/file.bin", "server":"https://n1.kemono.cr"}]}
+                        "previews": [{"path":"/a/file.bin", "server":None if missing_node else "https://n1.kemono.cr",
+                                      "type":"thumbnail" if fallback is not None else "other"}]}
         class Release:
             def __init__(self, repo, tag): pass
             def create(self, title): events.append("create")
@@ -245,10 +276,10 @@ class ArchiveTests(unittest.TestCase):
                 value = super().read(n)
                 self.offset += len(value)
                 return value
-        def reader(url, directory, part_bytes):
+        def reader(url, directory, part_bytes, image_only=False):
             calls.append(url)
-            if fail and url.endswith("/file.bin"):
-                raise app.DownloadFailure(28, 3)
+            if fail and url.endswith("/file.bin") and (not image_only or fallback is False):
+                raise app.DownloadFailure(28, 1)
             return Reader()
         with tempfile.TemporaryDirectory() as temp:
             env = {"GITHUB_ACTIONS":"true", "CREATOR_URL":"https://kemono.cr/fanbox/user/56018056",
@@ -262,11 +293,12 @@ class ArchiveTests(unittest.TestCase):
                     self.assertEqual(len(json.loads((Path(temp)/"failed-files.json").read_text())["files"]), 1)
                     return
                 app.main()
-            self.assertEqual(len(calls), 2)  # Shared failed/successful path is tried only once.
+            self.assertEqual(len(calls), 2 + int(fail and fallback is not None) - int(missing_node))
+            self.assertEqual(sum("/thumbnail/data/" in url for url in calls), int(fail and fallback is not None))
             self.assertEqual(events[-1], "publish")
             self.assertEqual(published[0][1], fail)
             manifest = json.loads(assets["archive-manifest.json"])
-            self.assertEqual(manifest["file_count"], 1 if fail else 2)
+            self.assertEqual(manifest["file_count"], 1 + int(not fail or fallback is True))
             self.assertEqual(manifest["original_bytes"], 8 if fail else 16)
             self.assertEqual(manifest["failed_file_count"], int(fail))
             self.assertEqual(manifest["complete"], not fail)
@@ -279,8 +311,17 @@ class ArchiveTests(unittest.TestCase):
                     failures = json.loads(assets["failed-files.json"])
                     self.assertEqual(json.load(archive.extractfile("metadata/failed-files.json")), failures)
                     item = failures["files"][0]
-                    self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 3, 30, 28))
+                    self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 0 if missing_node else 1, 10, 0 if missing_node else 28))
                     self.assertNotIn("media/a/file.bin", archive.getnames())
+                    self.assertEqual(manifest["preview_file_count"], int(fallback is True))
+                    self.assertEqual(manifest["preview_bytes"], 8 if fallback is True else 0)
+                    if fallback is True:
+                        self.assertEqual(archive.extractfile("previews/a/file.bin").read(), b"original")
+                        self.assertEqual(item["preview_archive_path"], "previews/a/file.bin")
+                        records = json.load(archive.extractfile("metadata/files.json"))
+                        self.assertEqual(records[0]["kind"], "preview")
+                    elif fallback is False:
+                        self.assertEqual(item["preview_failure"]["exit_code"], 28)
                     self.assertIn("INCOMPLETE", published[0][0])
                 else:
                     self.assertEqual(archive.extractfile("media/a/file.bin").read(), b"original")
