@@ -208,7 +208,7 @@ class MediaReader:
             if self.validator:
                 headers["If-Range"] = self.validator
             try:
-                r = self.opener.open(urllib.request.Request(self.url, headers=headers), timeout=120)
+                r = self.opener.open(urllib.request.Request(self.url, headers=headers), timeout=30)
                 if r.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
                     r.close()
                     raise RuntimeError("原文件被传输压缩，不能确认原始字节")
@@ -252,6 +252,7 @@ class MediaReader:
         self.failures += 1
         if self.failures > 5:
             raise RuntimeError("媒体超过5次恢复尝试") from None
+        print(f"原文件连接/读取重试{self.failures}/5，已接收{self.offset}字节。", flush=True)
         time.sleep(min(2 ** self.failures, 16))
 
     def read(self, length=-1):
@@ -292,14 +293,42 @@ class DiskReader:
         self.directory.cleanup()
 
 
+def run_download(command, *, env, path, budget):
+    process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline, next_progress = time.monotonic() + 1800, time.monotonic() + 30
+    try:
+        while True:
+            try:
+                code = process.wait(timeout=1)
+                if path.exists() and path.stat().st_size > budget:
+                    return subprocess.CompletedProcess(command, -100)
+                return subprocess.CompletedProcess(command, code)
+            except subprocess.TimeoutExpired:
+                size = path.stat().st_size if path.exists() else 0
+                if size > budget:
+                    return subprocess.CompletedProcess(command, -100)
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, 1800)
+                if time.monotonic() >= next_progress:
+                    print(f"{command[0]}已暂存{size}字节。", flush=True)
+                    next_progress = time.monotonic() + 30
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def open_media(url, directory, part_bytes):
-    probe = MediaReader(url)
-    if (os.environ.get("DOWNLOAD_MODE") == "stream"
-            or shutil.disk_usage(directory).free < probe.size + part_bytes + 256_000_000):
+    if not media_host(url):
+        raise ValueError("非官方下载地址")
+    budget = shutil.disk_usage(directory).free - part_bytes - 256_000_000
+    if os.environ.get("DOWNLOAD_MODE") == "stream" or budget <= 0:
         print("使用流式原文件读取，避免完整原文件占用磁盘。", flush=True)
-        return probe
-    size = probe.size
-    probe.close()
+        return MediaReader(url)
     staging = tempfile.TemporaryDirectory(prefix="original-", dir=directory)
     path = Path(staging.name) / "original.bin"
     # Download tools need neither account credentials nor the GitHub token.
@@ -313,8 +342,13 @@ def open_media(url, directory, part_bytes):
                 "--follow-metalink=false", "--all-proxy=", "--no-proxy=*", f"--user-agent={user_agent()}",
                 "--header=Accept-Encoding: identity", f"--dir={staging.name}", "--out=original.bin", url]
         try:
-            result = subprocess.run(aria, env=env, capture_output=True, timeout=1800)
-            good = result.returncode == 0 and path.is_file() and path.stat().st_size == size
+            print("启动aria2原文件下载。", flush=True)
+            result = run_download(aria, env=env, path=path, budget=budget)
+            if result.returncode == -100:
+                staging.cleanup()
+                print("原文件超过暂存预算，切换流式读取。", flush=True)
+                return MediaReader(url)
+            good = result.returncode == 0 and path.is_file()
         except (subprocess.TimeoutExpired, FileNotFoundError):
             good = False
         if not good:
@@ -328,8 +362,15 @@ def open_media(url, directory, part_bytes):
                         "--user-agent", user_agent(), "--header", "Accept-Encoding: identity",
                         "--output", str(path), url]
                 try:
-                    result = subprocess.run(curl, env=env, capture_output=True, timeout=1800)
-                    done = result.returncode == 0 and path.is_file() and path.stat().st_size == size
+                    print(f"启动curl原文件下载，第{attempt + 1}/3次。", flush=True)
+                    result = run_download(curl, env=env, path=path, budget=budget)
+                    if result.returncode == -100:
+                        staging.cleanup()
+                        print("原文件超过暂存预算，切换流式读取。", flush=True)
+                        return MediaReader(url)
+                    done = result.returncode == 0 and path.is_file()
+                    if result.returncode in (33, 36):
+                        path.unlink(missing_ok=True)
                 except subprocess.TimeoutExpired:
                     done = False
                 if done:
@@ -338,8 +379,8 @@ def open_media(url, directory, part_bytes):
                 if attempt < 2:
                     time.sleep(2 ** (attempt + 1))
             if not good:
-                raise RuntimeError("aria2/curl下载失败或原文件字节数不符")
-        return DiskReader(staging, path, size)
+                raise RuntimeError("aria2/curl下载未完整完成")
+        return DiskReader(staging, path, path.stat().st_size)
     except Exception:
         staging.cleanup()
         raise
@@ -499,6 +540,7 @@ def main():
                     add_json(archive, "metadata/profile.json", profile)
                     add_json(archive, "metadata/posts.json", posts)
                     for index, entry in enumerate(posts, 1):
+                        print(f"读取帖子详情{index}/{len(posts)}。", flush=True)
                         detail = api.get(f"/{service}/user/{user}/post/{entry['id']}")
                         post = detail.get("post") if isinstance(detail, dict) else None
                         if not isinstance(post, dict) or (post.get("service"), post.get("user"), post.get("id")) != (service, user, entry["id"]):
@@ -507,6 +549,7 @@ def main():
                         for item in file_references(detail):
                             if item["path"] in seen:
                                 continue
+                            print(f"准备原文件{len(files) + 1}，节点{urllib.parse.urlsplit(item['url']).hostname}。", flush=True)
                             media = open_media(item["url"], temp, writer.part_bytes)
                             try:
                                 name = "media/" + item["path"].lstrip("/")

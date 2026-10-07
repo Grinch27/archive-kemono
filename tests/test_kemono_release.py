@@ -187,10 +187,11 @@ class ArchiveTests(unittest.TestCase):
                 self.assertFalse(Path(str(target) + ".aria2").exists())
                 target.write_bytes(b"original")
                 return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl", "KEMONO_PASSWORD": "fixture", "GH_TOKEN": "fixture"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app.subprocess, "run", side_effect=run):
+            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl", "KEMONO_PASSWORD": "fixture", "GH_TOKEN": "fixture"}), patch.object(app, "MediaReader", return_value=probe) as stream, patch.object(app, "run_download", side_effect=run):
                 reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
                 self.assertEqual(reader.read(), b"original")
                 reader.close()
+                stream.assert_not_called()
             self.assertEqual(calls, ["aria2c", "curl"])
             self.assertEqual(list(Path(temp).iterdir()), [])
 
@@ -202,11 +203,12 @@ class ArchiveTests(unittest.TestCase):
                 directory = Path(next(x[6:] for x in command if x.startswith("--dir=")))
                 (directory / "original.bin").write_bytes(b"original")
                 return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app.subprocess, "run", side_effect=run) as command:
+            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe) as stream, patch.object(app, "run_download", side_effect=run) as command:
                 reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
                 self.assertEqual(reader.read(), b"original")
                 reader.close()
                 self.assertEqual(command.call_count, 1)
+                stream.assert_not_called()
 
     def test_changed_media_version_stops_resume(self):
         opener = Opener(Response(b"abc", {"Content-Length": "6", "ETag": '"v1"'}),
@@ -230,7 +232,7 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), b"ori")
                 target.write_bytes(b"original")
                 return SimpleNamespace(returncode=0)
-            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app.subprocess, "run", side_effect=run), patch.object(app.time, "sleep"):
+            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app, "run_download", side_effect=run), patch.object(app.time, "sleep"):
                 reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
                 self.assertEqual(reader.read(), b"original")
                 reader.close()
@@ -246,6 +248,15 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(reader.read(), b"original")
                 reader.close()
                 run.assert_not_called()
+
+    def test_download_budget_switches_to_stream(self):
+        with tempfile.TemporaryDirectory() as temp:
+            probe = app.MediaReader("https://n1.kemono.cr/data/a/file", Opener(Response(b"original", {"Content-Length": "8"})))
+            with patch.dict(os.environ, {"DOWNLOAD_MODE": "aria2-curl"}), patch.object(app, "MediaReader", return_value=probe), patch.object(app, "run_download", return_value=SimpleNamespace(returncode=-100)):
+                reader = app.open_media("https://n1.kemono.cr/data/a/file", temp, 10)
+                self.assertIs(reader, probe)
+                self.assertEqual(list(Path(temp).iterdir()), [])
+                reader.close()
 
     def test_local_execution_is_blocked_before_network(self):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch.object(app, "Api") as api:
