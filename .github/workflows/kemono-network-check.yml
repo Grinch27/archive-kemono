@@ -7,12 +7,25 @@ on:
 permissions:
   contents: read
 jobs:
+  runner-image:
+    name: ubuntu-latest - runner-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      RUNNER_IMAGE: ${{ steps.resolve-runner-image.outputs.RUNNER_IMAGE }}
+    steps:
+      - name: Resolve runner-image
+        id: resolve-runner-image
+        uses: Grinch27/github-actions/.github/actions/resolve-runner-image@main
+
   probe:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
+    needs: runner-image
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && needs.runner-image.outputs.RUNNER_IMAGE || matrix.os }}
     timeout-minutes: 5
     steps:
       - name: Probe official nodes without downloading media
