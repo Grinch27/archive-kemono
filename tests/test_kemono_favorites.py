@@ -124,6 +124,19 @@ class FavoritesTests(unittest.TestCase):
                 app.main()
             inventory.assert_not_called()
 
+    def test_paginated_assets_support_older_packaged_gh(self):
+        rows = b'{"id":1,"name":"first"}\n{"id":2,"name":"second"}\n'
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "fixture/repo"}), patch.object(app, "gh", return_value=rows) as gh:
+            self.assertEqual([a["id"] for a in app.assets(123)], [1, 2])
+            self.assertNotIn("--slurp", gh.call_args.args)
+
+    def test_cli_errors_show_only_safe_status(self):
+        result = SimpleNamespace(returncode=1, stderr=b'private-value unknown flag: --slurp', stdout=b'')
+        with patch.object(app.subprocess, "run", return_value=result), self.assertRaises(RuntimeError) as error:
+            app.gh("api", "fixture")
+        self.assertIn("unknown flag: --slurp", str(error.exception))
+        self.assertNotIn("private-value", str(error.exception))
+
     def test_upload_failure_retains_part(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app, "PART_BYTES", 30), patch.object(app, "upload", side_effect=RuntimeError("synthetic upload failure")):
             with self.assertRaises(RuntimeError):

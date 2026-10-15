@@ -91,7 +91,10 @@ def gh(*args, binary=False):
     result = subprocess.run(["gh", *args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, check=False)
     if result.returncode:
-        raise RuntimeError("GitHub operation failed; credentials and response omitted")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        safe = re.search(r"HTTP [0-9]{3}|unknown flag: --[a-z-]+", stderr)
+        hint = ", " + safe.group(0) if safe else ""
+        raise RuntimeError(f"GitHub {args[0]} operation failed: exit={result.returncode}{hint}; private response omitted")
     return result.stdout if binary else json.loads(result.stdout or b"null")
 
 
@@ -103,9 +106,10 @@ def repo():
 
 
 def assets(release_id):
-    pages = gh("api", f"repos/{repo()}/releases/{release_id}/assets?per_page=100",
-               "--paginate", "--slurp")
-    return [asset for page in pages for asset in page]
+    # Ubuntu's packaged gh 2.46 has pagination and jq, but not --slurp.
+    raw = gh("api", f"repos/{repo()}/releases/{release_id}/assets?per_page=100",
+             "--paginate", "--jq", ".[] | @json", binary=True)
+    return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 
 def upload(tag, release_id, path):
