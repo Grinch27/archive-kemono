@@ -60,6 +60,7 @@ jobs:
           import sys
           import subprocess
           import tarfile
+          import urllib.parse
           sys.path.insert(0, 'scripts')
           import kemono_favorites as app
           release_id = int(os.environ['STAGING_ID'])
@@ -109,10 +110,15 @@ jobs:
               if head_url and app.base.media_host(head_url):
                   env = {k: v for k, v in os.environ.items()
                          if not k.startswith(('GH_', 'GITHUB_', 'KEMONO_', 'ACTIONS_'))}
-                  result = subprocess.run(['curl', '--disable', '--head', '--silent', '--show-error',
-                      '--proto', '=https', '--noproxy', '*', '--retry', '0', '--connect-timeout', '5',
-                      '--max-time', '10', '--output', '/dev/null', '--write-out',
-                      'http=%{http_code} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}',
-                      head_url], env=env, capture_output=True, timeout=12)
-                  print('HEAD_DIAGNOSTIC=' + str(result.returncode) + ' ' + result.stdout.decode('ascii', errors='replace'))
+                  candidates = [('api_node', head_url),
+                      ('official_root', app.base.BASE + urllib.parse.urlsplit(head_url).path)]
+                  for label, url in candidates:
+                      result = subprocess.run(['curl', '--disable', '--head', '--silent', '--show-error',
+                          '--proto', '=https', '--noproxy', '*', '--retry', '0', '--connect-timeout', '5',
+                          '--max-time', '10', '--output', '/dev/null', '--write-out',
+                          'http=%{http_code} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n%{redirect_url}',
+                          url], env=env, capture_output=True, timeout=12)
+                      timing, _, redirect = result.stdout.decode('ascii', errors='replace').partition('\n')
+                      print('HEAD_DIAGNOSTIC=' + str(result.returncode) + ' ' + label + ' ' + timing
+                            + ' redirect_host=' + str(urllib.parse.urlsplit(redirect).hostname))
           PY
