@@ -70,7 +70,13 @@ def validate_inventory(posts, baseline):
     changed = sum(fingerprints.get(k) != v for k, v in baseline["posts"].items()
                   if k in fingerprints)
     if missing or changed:
-        raise RuntimeError(f"historical baseline mismatch: missing={len(missing)}, changed={changed}; private snapshot transfer required")
+        fields = []
+        for name, expected in baseline.get("field_hashes", {}).items():
+            actual = {digest(key(p)): [name in p, clean(p.get(name))] for p in posts
+                      if digest(key(p)) in baseline["posts"]}
+            if digest(actual) != expected:
+                fields.append(name)
+        raise RuntimeError(f"historical baseline mismatch: missing={len(missing)}, changed={changed}, fields={','.join(fields)}; private snapshot transfer required")
     return [clean(p) for p in posts]
 
 
