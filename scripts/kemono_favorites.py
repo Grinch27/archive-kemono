@@ -59,13 +59,20 @@ def key(post):
 def validate_inventory(posts, baseline):
     if not isinstance(posts, list) or not posts:
         raise ValueError("favorites API did not return a nonempty array")
-    identities, fingerprints = set(), {}
+    identities, fingerprints, normalized = set(), {}, []
     for post in posts:
         identity = key(post)
         if identity in identities:
             raise ValueError("duplicate favorite post")
         identities.add(identity)
-        fingerprints[digest(identity)] = digest(clean(post))
+        safe = clean(post)
+        identity_hash = digest(identity)
+        # The snapshot used one fixed schema. API-only additions do not change its
+        # historical version; compare the exact original fields, not an expanded API object.
+        if identity_hash in baseline["posts"] and baseline.get("field_hashes"):
+            safe = {k: v for k, v in safe.items() if k in baseline["field_hashes"]}
+        fingerprints[identity_hash] = digest(safe)
+        normalized.append(safe)
     missing = set(baseline["posts"]) - fingerprints.keys()
     changed = sum(fingerprints.get(k) != v for k, v in baseline["posts"].items()
                   if k in fingerprints)
@@ -77,7 +84,7 @@ def validate_inventory(posts, baseline):
             if digest(actual) != expected:
                 fields.append(name)
         raise RuntimeError(f"historical baseline mismatch: missing={len(missing)}, changed={changed}, fields={','.join(fields)}; private snapshot transfer required")
-    return [clean(p) for p in posts]
+    return normalized
 
 
 def gh(*args, binary=False):

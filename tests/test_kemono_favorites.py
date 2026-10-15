@@ -42,6 +42,16 @@ class FavoritesTests(unittest.TestCase):
         self.assertEqual(result["nested"], [{"keep": None}])
         self.assertIn("faved_seq", source)
 
+    def test_api_additional_fields_preserve_exact_historical_snapshot(self):
+        source = post(1)
+        baseline = {"posts": {app.digest(app.key(source)): app.digest(app.clean(source))},
+                    "field_hashes": {k: "unused" for k in app.clean(source)}}
+        expanded = {**source, "api_only_field": "new version metadata"}
+        self.assertEqual(app.validate_inventory([expanded], baseline), [app.clean(source)])
+        expanded["content"] = "changed historical text"
+        with self.assertRaises(RuntimeError):
+            app.validate_inventory([expanded], baseline)
+
     def test_html_media_and_trusted_nodes(self):
         source = post(1)
         source["content"] = ('<img src="https://downloads.fanbox.cc/example.jpg">'
