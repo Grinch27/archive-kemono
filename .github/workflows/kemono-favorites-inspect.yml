@@ -1,0 +1,74 @@
+# 待确认：被检查的暂存Release；歧义：下载次数不等于去重后的媒体数量。
+# 后续研究：仅在需要时核查失败类别；潜在优化：无。
+# 风险：仅读取JSON统计，不读取媒体或输出收藏队列；验证重点：只读、计数、权限隔离。
+name: Favourite archive inspect
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/kemono-favorites-inspect.yml]
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "暂存Release ID"
+        type: string
+        default: "413942089"
+        required: true
+permissions: write-all
+env:
+  CONTAINER_IMAGE: &container_image ubuntu:devel
+  DEBIAN_FRONTEND: noninteractive
+  TZ: Etc/UTC
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+jobs:
+  runner-image:
+    runs-on: ubuntu-latest
+    outputs:
+      RUNNER_IMAGE: ${{ steps.resolve.outputs.RUNNER_IMAGE }}
+    steps:
+      - id: resolve
+        uses: Grinch27/github-actions/.github/actions/resolve-runner-image@main
+  inspect:
+    needs: runner-image
+    runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    container:
+      image: *container_image
+    timeout-minutes: 10
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get -yqq update
+          apt-get -yqq install --no-install-recommends ca-certificates curl python3 gh git
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - name: Read completed batch counters
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_ID: ${{ inputs.release_id || '413942089' }}
+        run: |
+          python3 -u - <<'PY'
+          import collections
+          import json
+          import os
+          import re
+          import sys
+          sys.path.insert(0, 'scripts')
+          import kemono_favorites as app
+          release_id = int(os.environ['STAGING_ID'])
+          totals, count = collections.Counter(), 0
+          for item in sorted(app.assets(release_id), key=lambda x: x['name']):
+              if not re.fullmatch(r'batch-[0-9]{5}\.json', item['name']):
+                  continue
+              batch = app.gh('api', f"repos/{app.repo()}/releases/assets/{item['id']}",
+                             '-H', 'Accept: application/octet-stream')
+              counts = batch['counts']
+              if any(not isinstance(v, int) or v < 0 for v in counts.values()):
+                  raise ValueError('invalid archive counters')
+              totals.update(counts)
+              count += 1
+          print('ARCHIVE_COUNTERS=' + json.dumps({'completed_batches': count, **totals}, sort_keys=True))
+          PY
