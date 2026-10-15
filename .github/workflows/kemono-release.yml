@@ -9,11 +9,6 @@ name: Kemono author to Release
 # https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#yaml-anchors-and-aliases
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/*.yml"
   workflow_dispatch:
     inputs:
       creator_url:

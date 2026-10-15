@@ -1,0 +1,126 @@
+# 待确认：账号Secrets、历史快照一致性、原文件可达性、总容量。
+# 后续研究：失败补下；潜在优化：实测后调整并行度和每批帖子数。
+# 风险：会下载真实媒体并发布公开Release；中间草稿保留，不自动删除。
+# 验证重点：原始收藏不进Git、仅私有草稿暂存、单tar.xz、9e、1800MB、重下载解压校验。
+name: Favourite Posts archive
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/favorites-request.json]
+  workflow_dispatch:
+
+permissions: write-all
+
+concurrency:
+  group: kemono-favorites-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CONTAINER_IMAGE: &container_image ubuntu:devel
+  DEBIAN_FRONTEND: noninteractive
+  DEBCONF_NONINTERACTIVE_SEEN: "true"
+  APT_LISTCHANGES_FRONTEND: none
+  NEEDRESTART_MODE: a
+  FORCE_UNSAFE_CONFIGURE: "1"
+  TZ: Etc/UTC
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  GIT_TERMINAL_PROMPT: "0"
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  ALL_PROXY: ""
+  NO_PROXY: "*"
+
+jobs:
+  runner-image:
+    runs-on: ubuntu-latest
+    outputs:
+      RUNNER_IMAGE: ${{ steps.resolve.outputs.RUNNER_IMAGE }}
+    steps:
+      - name: Resolve runner-image
+        id: resolve
+        uses: Grinch27/github-actions/.github/actions/resolve-runner-image@main
+
+  inventory:
+    needs: runner-image
+    runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    container: &favorites_container
+      image: *container_image
+    timeout-minutes: 30
+    outputs:
+      staging_id: ${{ steps.inventory.outputs.staging_id }}
+      staging_tag: ${{ steps.inventory.outputs.staging_tag }}
+      matrix: ${{ steps.inventory.outputs.matrix }}
+      target_count: ${{ steps.inventory.outputs.target_count }}
+    steps:
+      - name: Install tools
+        run: &install_tools |
+          set -euo pipefail
+          unset http_proxy https_proxy all_proxy no_proxy
+          export no_proxy='*'
+          apt-get -yqq update
+          apt-get -yqq install --no-install-recommends ca-certificates curl xz-utils python3 gh git
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - name: Offline regression
+        run: python3 -m unittest discover -s tests -q -b
+      - name: Freeze and validate favorites
+        id: inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEMONO_USERNAME: ${{ secrets.KEMONO_USERNAME }}
+          KEMONO_PASSWORD: ${{ secrets.KEMONO_PASSWORD }}
+        run: python3 -u scripts/kemono_favorites.py inventory
+
+  download:
+    needs: [runner-image, inventory]
+    runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    container: *favorites_container
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        index: ${{ fromJSON(needs.inventory.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STAGING_ID: ${{ needs.inventory.outputs.staging_id }}
+      STAGING_TAG: ${{ needs.inventory.outputs.staging_tag }}
+      BATCH_INDEX: ${{ matrix.index }}
+    steps:
+      - name: Install tools
+        run: *install_tools
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - name: Download favorite posts and stage verified parts
+        run: python3 -u scripts/kemono_favorites.py batch --index "$BATCH_INDEX"
+
+  release:
+    needs: [runner-image, inventory, download]
+    runs-on: ${{ needs.runner-image.outputs.RUNNER_IMAGE }}
+    container: *favorites_container
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STAGING_ID: ${{ needs.inventory.outputs.staging_id }}
+      STAGING_TAG: ${{ needs.inventory.outputs.staging_tag }}
+    steps:
+      - name: Install tools
+        run: *install_tools
+      - uses: actions/checkout@main
+        with:
+          persist-credentials: false
+      - name: Assemble single extreme xz archive and verify before publication
+        id: release
+        run: python3 -u scripts/kemono_favorites.py assemble
+      - name: Release link
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+        run: printf '%s\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
