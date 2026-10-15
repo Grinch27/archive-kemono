@@ -1,6 +1,7 @@
 # 待确认：被检查的暂存Release；歧义：下载次数不等于去重后的媒体数量。
 # 后续研究：仅在需要时核查失败类别；潜在优化：无。
-# 风险：仅读取JSON统计，不读取媒体或输出收藏队列；验证重点：只读、计数、权限隔离。
+# 风险：云端解压一个样本批次做校验，不输出原文；仅对可信原节点做一次HEAD，不自动换源。
+# 验证重点：只读、计数、权限隔离、gzip完整性、原件失败码及HEAD时序。
 name: Favourite archive inspect
 on:
   push:
@@ -52,14 +53,17 @@ jobs:
         run: |
           python3 -u - <<'PY'
           import collections
+          import gzip
           import json
           import os
           import re
           import sys
+          import subprocess
+          import tarfile
           sys.path.insert(0, 'scripts')
           import kemono_favorites as app
           release_id = int(os.environ['STAGING_ID'])
-          totals, count = collections.Counter(), 0
+          totals, count, sample = collections.Counter(), 0, None
           for item in sorted(app.assets(release_id), key=lambda x: x['name']):
               if not re.fullmatch(r'batch-[0-9]{5}\.json', item['name']):
                   continue
@@ -70,5 +74,45 @@ jobs:
                   raise ValueError('invalid archive counters')
               totals.update(counts)
               count += 1
+              if batch['index'] == 4:
+                  sample = batch
           print('ARCHIVE_COUNTERS=' + json.dumps({'completed_batches': count, **totals}, sort_keys=True))
+          if sample:
+              codes, members = collections.Counter(), collections.Counter()
+              head_url = None
+              reader = app.PartReader(sample['parts'])
+              try:
+                  with gzip.GzipFile(fileobj=reader, mode='rb') as compressed:
+                      with tarfile.open(fileobj=compressed, mode='r|') as archive:
+                          for member in archive:
+                              app.safe_member(member)
+                              if member.name.startswith('media/'):
+                                  members['original_files'] += 1
+                              if member.name.startswith('previews/'):
+                                  members['preview_files'] += 1
+                              if member.name.endswith('/status.json'):
+                                  with archive.extractfile(member) as source:
+                                      status = json.load(source)
+                                  for record in status['media']:
+                                      failure = record.get('original_failure')
+                                      if failure:
+                                          codes[str(failure['exit_code'])] += 1
+                                          head_url = head_url or record.get('url')
+                      while compressed.read(1048576):
+                          pass
+                  if reader.position != len(sample['parts']):
+                      raise ValueError('sample archive not fully consumed')
+              finally:
+                  reader.close()
+              print('SAMPLE_ARCHIVE_CHECK=' + json.dumps({'verified_gzip': True, **members,
+                    'original_failure_record_codes': dict(codes)}, sort_keys=True))
+              if head_url and app.base.media_host(head_url):
+                  env = {k: v for k, v in os.environ.items()
+                         if not k.startswith(('GH_', 'GITHUB_', 'KEMONO_', 'ACTIONS_'))}
+                  result = subprocess.run(['curl', '--disable', '--head', '--silent', '--show-error',
+                      '--proto', '=https', '--noproxy', '*', '--retry', '0', '--connect-timeout', '5',
+                      '--max-time', '10', '--output', '/dev/null', '--write-out',
+                      'http=%{http_code} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}',
+                      head_url], env=env, capture_output=True, timeout=12)
+                  print('HEAD_DIAGNOSTIC=' + str(result.returncode) + ' ' + result.stdout.decode('ascii', errors='replace'))
           PY
