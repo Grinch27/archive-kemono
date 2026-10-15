@@ -1,6 +1,6 @@
 # 待确认：被检查的暂存Release；歧义：下载次数不等于去重后的媒体数量。
 # 后续研究：仅在需要时核查失败类别；潜在优化：无。
-# 风险：云端解压一个样本批次做校验，不输出原文；仅对可信原节点做一次HEAD，不自动换源。
+# 风险：云端解压一个样本批次做校验，不输出原文；仅做可信官方HTTPS路径HEAD，不自动换源。
 # 验证重点：只读、计数、权限隔离、gzip完整性、原件失败码及HEAD时序。
 name: Favourite archive inspect
 on:
@@ -119,6 +119,13 @@ jobs:
                           'http=%{http_code} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n%{redirect_url}',
                           url], env=env, capture_output=True, timeout=12)
                       timing, _, redirect = result.stdout.decode('ascii', errors='replace').partition('\n')
+                      destination = urllib.parse.urlsplit(redirect)
                       print('HEAD_DIAGNOSTIC=' + str(result.returncode) + ' ' + label + ' ' + timing
-                            + ' redirect_host=' + str(urllib.parse.urlsplit(redirect).hostname))
+                            + ' redirect_scheme=' + destination.scheme
+                            + ' redirect_host=' + str(destination.hostname))
+                      if label == 'official_root' and redirect:
+                          secured = urllib.parse.urlunsplit(('https', destination.netloc,
+                              destination.path, destination.query, destination.fragment))
+                          if app.base.media_host(secured):
+                              candidates.append(('official_redirect_https', secured))
           PY
