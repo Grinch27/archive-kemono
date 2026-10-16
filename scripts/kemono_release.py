@@ -279,8 +279,8 @@ class PartWriter:
         return True
 
     def _start(self):
-        if len(self.assets) >= 998:
-            raise RuntimeError("达到998分卷上限，另保留manifest和失败清单附件名额")
+        if len(self.assets) >= 997:
+            raise RuntimeError("达到997分卷上限；每个Release另保留至少3个元数据附件名额")
         if shutil.disk_usage(self.directory).free < self.part_bytes + 128_000_000:
             raise RuntimeError("runner剩余磁盘不足一个分卷加128MB余量")
         self.path = self.directory / f"{self.stem}.part{len(self.assets) + 1:05d}"

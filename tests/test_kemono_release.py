@@ -102,6 +102,13 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.PartWriter(".", "fixture", 2_000_000_000, lambda p: None)
 
+    def test_release_asset_budget_reserves_three_metadata_slots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            writer = app.PartWriter(temp, "fixture", 10, lambda path: None)
+            writer.assets = [{"name": "fixture"}] * 997
+            with self.assertRaisesRegex(RuntimeError, "997"):
+                writer.write(b"x")
+
     def test_failed_upload_retains_chunk_and_low_disk_stops(self):
         with tempfile.TemporaryDirectory() as temp:
             def fail(path):
