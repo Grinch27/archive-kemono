@@ -358,7 +358,7 @@ elif args[0] == "api":
                     return
                 app.main()
             self.assertEqual(len(calls), 3 + 2 * int(fail and fallback is not None) - 2 * int(missing_node))
-            self.assertEqual(sum("/thumbnail/data/" in url for url in calls), int(fail and fallback is not None))
+            self.assertEqual(sum("/thumbnail/data/" in url for url in calls), 2 * int(fail and fallback is not None))
             result_dir = Path(temp)/"kemono-archive"
             manifest = json.loads((result_dir/"archive-manifest.json").read_text())
             notes = (result_dir/"release-notes.md").read_text()
