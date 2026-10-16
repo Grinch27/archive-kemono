@@ -386,8 +386,8 @@ def batch(index, staging_id, staging_tag):
     counts = {"posts_processed": 0, "metadata_saved": 0, "original_saved": 0,
               "preview_saved": 0, "missing_originals": 0, "detail_failed": 0}
     def produce(archive):
-        saved = {}
         for position, snapshot in enumerate(selected, 1):
+            saved = {}  # V2 media must be contained within this post, not reused across post folders.
             service, user, post_id = key(snapshot)
             planned = registry.favourite_post(snapshot)
             prefix = planned.relative
