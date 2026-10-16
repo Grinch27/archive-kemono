@@ -55,10 +55,18 @@ titles are for readability, not identification.
 - The existing streamed, size-checked Release upload, 1,800 MB default part
   size, API safeguards, and original/preview one-attempt three-second timeouts
   remain unchanged.
-- The compressed release is a **single tar.xz stream split across part files**;
-  concatenate the ordered parts before extracting. Release metadata
-  (manifest, summary, registry) is stored as separate release assets rather
-  than V1-style root directories inside the tar.
+- The compressed Favourite Posts release is always **one tar.xz stream**.
+  When the upload fits in exactly one part, the final asset is named
+  `favorites.tar.xz` and can be extracted directly. When the stream requires
+  multiple parts, the final assets are named
+  `favorites.tar.xz.part00001`, `favorites.tar.xz.part00002`, etc.; download
+  all parts and concatenate them in numeric order before extracting.
+  The streaming uploader cannot know the part count in advance, so the
+  single uploaded part is renamed on GitHub **after complete xz verification**
+  by updating the asset name in place (same asset ID, size and digest).
+  `archive-manifest.json` and the Release description use the final name.
+  Release metadata (manifest, summary, registry) remains separate from
+  the tar stream, never in V1-style root directories.
 
 ## Operations and privacy
 

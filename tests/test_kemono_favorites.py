@@ -199,7 +199,77 @@ class FavoritesTests(unittest.TestCase):
                                        lambda archive: app.add_bytes(archive, "data", b"abc"))
             self.assertTrue(list(Path(directory).glob("*.part*")))
 
+    def test_single_part_asset_renamed_without_reupload(self):
+        part = {"id": 41, "name": "favorites.tar.xz.part00001",
+                "size": 1234, "state": "uploaded"}
+        asset = {**part, "digest": "sha256:" + "a" * 64}
+        events = []
+        def fake_gh(*args, **kwargs):
+            events.append(args)
+            self.assertIn("PATCH", args)
+            self.assertIn("name=favorites.tar.xz", args)
+            asset["name"] = "favorites.tar.xz"
+            return dict(asset)
+        with patch.object(app, "assets", side_effect=lambda release_id: [dict(asset)]), \
+                patch.object(app, "gh", side_effect=fake_gh), \
+                patch.dict(os.environ, {"GITHUB_REPOSITORY": "fixture/repo"}):
+            parts = [dict(part)]
+            result = app.final_archive_asset_names(parts, 98)
+        self.assertIs(result, parts)
+        self.assertEqual(parts[0]["name"], "favorites.tar.xz")
+        self.assertEqual(parts[0]["id"], 41)
+        self.assertEqual(parts[0]["size"], 1234)
+        self.assertEqual(len(events), 1)
+        self.assertIn("no concatenation needed", app.final_archive_download_notes(parts))
+
+    def test_multi_part_assets_keep_numeric_names(self):
+        parts = [
+            {"id": 41, "name": "favorites.tar.xz.part00001", "size": 200},
+            {"id": 42, "name": "favorites.tar.xz.part00002", "size": 125},
+        ]
+        with patch.object(app, "gh") as gh, patch.object(app, "assets") as assets:
+            self.assertIs(app.final_archive_asset_names(parts, 98), parts)
+            gh.assert_not_called()
+            assets.assert_not_called()
+        self.assertEqual([x["name"] for x in parts],
+                         ["favorites.tar.xz.part00001", "favorites.tar.xz.part00002"])
+        self.assertIn("concatenate", app.final_archive_download_notes(parts))
+
+    def test_single_part_rename_refuses_destination_collision(self):
+        part = {"id": 41, "name": "favorites.tar.xz.part00001", "size": 10}
+        remote = [{**part, "state": "uploaded"},
+                  {"id": 42, "name": "favorites.tar.xz", "size": 10, "state": "uploaded"}]
+        with patch.object(app, "assets", return_value=remote), patch.object(app, "gh") as gh:
+            with self.assertRaisesRegex(RuntimeError, "collision"):
+                app.final_archive_asset_names([part], 98)
+            gh.assert_not_called()
+        self.assertEqual(part["name"], "favorites.tar.xz.part00001")
+
+    def test_single_part_rename_rejects_changed_remote_digest(self):
+        part = {"id": 41, "name": "favorites.tar.xz.part00001", "size": 10}
+        before = {**part, "state": "uploaded", "digest": "sha256:" + "a" * 64}
+        after = {**part, "name": "favorites.tar.xz",
+                 "state": "uploaded", "digest": "sha256:" + "b" * 64}
+        def fake_assets(_):
+            return [before] if not called[0] else [after]
+        called = [False]
+        def fake_gh(*args, **kwargs):
+            called[0] = True
+            return after
+        with patch.object(app, "assets", side_effect=fake_assets), \
+                patch.object(app, "gh", side_effect=fake_gh), \
+                patch.dict(os.environ, {"GITHUB_REPOSITORY": "fixture/repo"}):
+            with self.assertRaisesRegex(RuntimeError, "digest"):
+                app.final_archive_asset_names([part], 98)
+        self.assertEqual(part["name"], "favorites.tar.xz.part00001")
+
+    def test_full_synthetic_pipeline_single_archive_filename(self):
+        self._exercise_synthetic_pipeline(part_bytes=20000)
+
     def test_full_synthetic_pipeline_two_batches_single_extreme_xz(self):
+        self._exercise_synthetic_pipeline(part_bytes=200)
+
+    def _exercise_synthetic_pipeline(self, part_bytes):
         targets = [app.clean(post(i)) for i in range(3)]
         store, payloads, next_id, publications = {}, {}, [10], []
         def upload(tag, release_id, path):
@@ -238,10 +308,17 @@ class FavoritesTests(unittest.TestCase):
             yield path
             path.unlink()
         def github(*args, **kwargs):
+            if (args and args[0] == "api" and len(args) > 1 and
+                    "/releases/assets/" in args[1] and "PATCH" in args):
+                asset_id = int(args[1].rsplit("/", 1)[1])
+                matching = [a for a in store[2] if a["id"] == asset_id]
+                self.assertEqual(len(matching), 1)
+                matching[0]["name"] = "favorites.tar.xz"
+                return dict(matching[0])
             publications.append(args)
             return {}
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            for target, value in (("BATCH_SIZE", 2), ("PART_BYTES", 200), ("upload", upload),
+            for target, value in (("BATCH_SIZE", 2), ("PART_BYTES", part_bytes), ("upload", upload),
                                   ("download_json_asset", read_json), ("PartReader", Reader),
                                   ("assets", lambda release_id: store.get(release_id, [])),
                                   ("create_draft", lambda *args: 2), ("gh", github), ("download", download)):
@@ -255,8 +332,14 @@ class FavoritesTests(unittest.TestCase):
             self.assertTrue(manifest["verified"])
             self.assertTrue(manifest["complete"])
             self.assertEqual(manifest["target_union_total"], 3)
-            self.assertGreaterEqual(len(manifest["assets"]), 3)
-            self.assertTrue(all(0 < p["size"] <= 200 for p in manifest["assets"]))
+            if part_bytes > 200:
+                self.assertEqual([p["name"] for p in manifest["assets"]],
+                                 ["favorites.tar.xz"])
+            else:
+                self.assertGreaterEqual(len(manifest["assets"]), 3)
+                self.assertTrue(all(p["name"].startswith("favorites.tar.xz.part")
+                                    for p in manifest["assets"]))
+            self.assertTrue(all(0 < p["size"] <= part_bytes for p in manifest["assets"]))
             compressed = b"".join(payloads[p["id"]] for p in manifest["assets"])
             with tarfile.open(fileobj=io.BytesIO(compressed), mode="r:xz") as archive:
                 self.assertEqual(sum("/media/" in n for n in archive.getnames()), 3)
@@ -265,6 +348,9 @@ class FavoritesTests(unittest.TestCase):
                 self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/[0]合成标题/snapshot.json").read())
             self.assertEqual(len(publications), 1)
             self.assertIn("draft=false", publications[0])
+            notes = next(x for x in publications[0] if x.startswith("body="))
+            self.assertIn(("no concatenation needed" if part_bytes > 200
+                           else "concatenate in numeric order"), notes)
 
 
 if __name__ == "__main__":

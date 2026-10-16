@@ -528,6 +528,55 @@ def verify_archive(parts, expected):
         reader.close()
 
 
+
+def final_archive_asset_names(parts, release_id):
+    """Rename the sole uploaded part without reuploading or changing its asset ID."""
+    if not parts:
+        raise RuntimeError("final archive produced no parts")
+    if len(parts) != 1:
+        return parts
+    part = parts[0]
+    source_name, destination_name = "favorites.tar.xz.part00001", "favorites.tar.xz"
+    if part["name"] != source_name:
+        raise RuntimeError("unexpected single-part archive name")
+    before = assets(release_id)
+    matching = [a for a in before if a.get("id") == part["id"]]
+    if (len(matching) != 1 or matching[0].get("name") != source_name
+            or matching[0].get("size") != part["size"]
+            or matching[0].get("state") != "uploaded"
+            or any(a.get("name") == destination_name for a in before)):
+        raise RuntimeError("single-part asset mismatch or destination collision")
+    changed = gh("api", f"repos/{repo()}/releases/assets/{part['id']}",
+                 "--method", "PATCH", "-f", f"name={destination_name}")
+    if (not isinstance(changed, dict) or changed.get("id") != part["id"]
+            or changed.get("name") != destination_name
+            or changed.get("size") != part["size"]
+            or changed.get("state") != "uploaded"):
+        raise RuntimeError("single-part rename response mismatch")
+    after = assets(release_id)
+    renamed = [a for a in after if a.get("id") == part["id"]]
+    if (len(renamed) != 1 or renamed[0].get("name") != destination_name
+            or renamed[0].get("size") != part["size"]
+            or renamed[0].get("state") != "uploaded"):
+        raise RuntimeError("single-part remote rename verification failed")
+    if (matching[0].get("digest") and
+            matching[0]["digest"] != renamed[0].get("digest")):
+        raise RuntimeError("single-part content digest changed during rename")
+    parts[0] = {**part, "name": destination_name}
+    return parts
+
+
+def final_archive_download_notes(parts):
+    if len(parts) == 1 and parts[0]["name"] == "favorites.tar.xz":
+        return ("Download favorites.tar.xz directly; no concatenation needed. "
+                "Linux: `tar -xf favorites.tar.xz`. "
+                "Windows: open favorites.tar.xz with 7-Zip.\n\n")
+    return ("Download every favorites.tar.xz.partNNNNN, concatenate in numeric order, "
+            "then extract tar.xz. "
+            "Linux: `cat favorites.tar.xz.part* > favorites.tar.xz && tar -xf favorites.tar.xz`. "
+            "Windows cmd: `copy /b favorites.tar.xz.part* favorites.tar.xz`.\n\n")
+
+
 def assemble(staging_id, staging_tag):
     posts = download_json_asset(staging_id, "targets.json")
     registry = layout.FrozenLayout.from_dict(download_json_asset(staging_id, "layout-registry.json"))
@@ -590,6 +639,7 @@ def assemble(staging_id, staging_tag):
     parts, _ = write_part_archive(directory, "favorites.tar.xz", tag, release_id, produce, extreme=True)
     print("Re-downloading final parts in cloud to verify every member and xz CRC64", flush=True)
     verify_archive(parts, seen)
+    final_archive_asset_names(parts, release_id)
     path = directory / "archive-manifest.json"
     save_json(path, {**summary, "assets": parts, "verified": True, "member_count": len(seen)})
     upload(tag, release_id, path)
@@ -604,10 +654,8 @@ def assemble(staging_id, staging_tag):
              + f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
              f"Processed {len(posts)} favourite posts. Metadata saved: {totals['metadata_saved']}. "
              f"Original downloads: {totals['original_saved']}; previews: {totals['preview_saved']}.\n\n"
-             "Download every favorites.tar.xz.partNNNNN, concatenate in numeric order, then extract tar.xz. "
-             "Linux: `cat favorites.tar.xz.part* > favorites.tar.xz && tar -xf favorites.tar.xz`. "
-             "Windows cmd: `copy /b favorites.tar.xz.part* favorites.tar.xz`.\n\n"
-             "Each post has snapshot.json, original content.html when present, and status.json. "
+             + final_archive_download_notes(parts)
+             + "Each post has snapshot.json, original content.html when present, and status.json. "
              "status.json records all media references and failures. External embeds remain references. "
              "Media and previews use stable filenames; their post associations are in status.json. "
              "Every final archive member and the complete xz stream were verified in GitHub Actions. "
