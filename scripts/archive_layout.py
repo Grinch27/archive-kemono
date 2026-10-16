@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Mapping, Optional, Tuple
 
 VERSION = 2
+LAYOUT_NAME = "service/author_id/[post_id]title"
 MAX_TITLE_BYTES = 112
 MAX_POST_COMPONENT_BYTES = 180
 MAX_POST_RELATIVE_BYTES = 205
@@ -229,7 +230,8 @@ def page_media_entries(post, detail=None):
     for field in ("file", "shared_file"):
         item = post.get(field)
         if isinstance(item, dict) and item.get("path"):
-            out.append({"raw": item["path"], "field": field, "name": item.get("name")})
+            out.append({"raw": item["path"], "field": field,
+                        "name": item.get("name"), "server": item.get("server")})
     parser = _PageMedia()
     content = post.get("content")
     if isinstance(content, str):
@@ -237,12 +239,14 @@ def page_media_entries(post, detail=None):
     out.extend(parser.refs)
     for item in post.get("attachments") or []:
         if isinstance(item, dict) and item.get("path"):
-            out.append({"raw": item["path"], "field": "attachment", "name": item.get("name")})
+            out.append({"raw": item["path"], "field": "attachment",
+                        "name": item.get("name"), "server": item.get("server")})
     if isinstance(detail, dict):
         for field in ("attachments", "videos"):
             for item in detail.get(field) or []:
                 if isinstance(item, dict) and item.get("path"):
-                    out.append({"raw": item["path"], "field": field, "name": item.get("name")})
+                    out.append({"raw": item["path"], "field": field,
+                        "name": item.get("name"), "server": item.get("server")})
     return out
 
 

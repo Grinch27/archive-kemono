@@ -109,7 +109,7 @@ def file_references(detail):
         else:
             path = canonical_path(raw)
             direct_url = None
-        server = resolved.get(path)
+        server = entry.get("server") or resolved.get(path)
         if server:
             parsed_server = urllib.parse.urlsplit(server)
             if (not media_host(server) or parsed_server.path not in ("", "/")
@@ -428,9 +428,16 @@ def main():
                                 save_failures(failure_path, source, failures)
                                 continue
                         try:
+                            preview_suffix = ".jpg"
+                            if kind == "preview" and isinstance(media, DiskReader):
+                                # Production disk reader supports a non-consuming header probe.
+                                head = media.file.read(16)
+                                media.file.seek(0)
+                                preview_suffix = layout.preview_image_suffix(head)
                             name = planned.media_member(
                                 item["path"], position=item["page_position"],
-                                total_media=item["page_media_total"], preview=(kind == "preview"))
+                                total_media=item["page_media_total"], preview=(kind == "preview"),
+                                preview_suffix=preview_suffix)
                             info = tarfile.TarInfo(name)
                             info.size, info.mode, info.mtime = media.size, 0o644, 0
                             archive.addfile(info, media)
