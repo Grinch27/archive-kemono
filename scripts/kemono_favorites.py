@@ -357,6 +357,21 @@ def safe_member(member):
         raise ValueError("unsafe staging archive member")
 
 
+def require_v2_member(name, approved_posts):
+    """Reject all V1/root-level archive layouts and all unknown post-local files."""
+    parts = PurePosixPath(name).parts
+    if len(parts) < 4 or "/".join(parts[:3]) not in approved_posts:
+        raise ValueError("unsupported or unknown archive member; V2 only")
+    tail = parts[3:]
+    if len(tail) == 1 and tail[0] in {
+            "post.json", "snapshot.json", "listing.json", "detail.json",
+            "content.html", "status.json", "offline.html"}:
+        return
+    if len(tail) == 2 and tail[0] in ("media", "previews") and tail[1] not in ("", ".", ".."):
+        return
+    raise ValueError("unsupported archive member path; V2 only")
+
+
 def write_part_archive(directory, stem, tag, release_id, produce, extreme=False):
     uploaded = []
     def ready(path):
@@ -450,7 +465,7 @@ def batch(index, staging_id, staging_tag):
         return counts
     parts, _ = write_part_archive(directory, f"batch-{index:05d}.tar.gz", staging_tag, staging_id, produce)
     path = directory / f"batch-{index:05d}.json"
-    save_json(path, {"index": index, "parts": parts, "counts": counts})
+    save_json(path, {"schema_version": layout.VERSION, "index": index, "parts": parts, "counts": counts})
     upload(staging_tag, staging_id, path)
 
 
@@ -543,6 +558,8 @@ def assemble(staging_id, staging_tag):
     manifests = [download_json_asset(staging_id, f"batch-{i:05d}.json") for i in range(batch_count)]
     remote = {a["id"]: a for a in assets(staging_id)}
     for index, manifest in enumerate(manifests):
+        if manifest.get("schema_version") != layout.VERSION:
+            raise RuntimeError("V1 batch manifests are unsupported; V2 only")
         if manifest["index"] != index:
             raise RuntimeError("batch index mismatch")
         if manifest["counts"]["posts_processed"] != len(posts[index * BATCH_SIZE:(index + 1) * BATCH_SIZE]):
@@ -554,10 +571,15 @@ def assemble(staging_id, staging_tag):
     directory = Path(os.environ["RUNNER_TEMP"]) / "favorites-final"
     directory.mkdir(exist_ok=False)
     tag = staging_tag.replace("-staging-", "-archive-")
-    release_id = create_draft(tag, "Favourite Posts · assembling")
+    release_id = create_draft(tag, "Favourite Posts V2 · assembling")
     seen = {}
     totals = {name: sum(m["counts"][name] for m in manifests) for name in manifests[0]["counts"]}
-    summary = {"schema_version": 2, "layout": "service/author_id/[post_id]title",
+    approved_batches = [
+        {registry.favourite_post(post).relative
+         for post in posts[i * BATCH_SIZE:(i + 1) * BATCH_SIZE]}
+        for i in range(batch_count)
+    ]
+    summary = {"schema_version": layout.VERSION, "layout": "service/author_id/[post_id]title",
                "target_union_total": len(posts), **totals, "posts_pending": 0,
                "complete": totals["missing_originals"] == 0 and totals["detail_failed"] == 0,
                "compression": "xz -9e; one tar stream; CRC64", "part_bytes_max": PART_BYTES,
@@ -570,6 +592,7 @@ def assemble(staging_id, staging_tag):
                     with tarfile.open(fileobj=compressed, mode="r|") as source_tar:
                         for member in source_tar:
                             safe_member(member)
+                            require_v2_member(member.name, approved_batches[manifest["index"]])
                             with source_tar.extractfile(member) as source:
                                 copy_member(archive, member, source, seen)
                     while compressed.read(1_048_576):
@@ -600,7 +623,8 @@ def assemble(staging_id, staging_tag):
     save_json(summary_path, summary)
     upload(tag, release_id, summary_path)
     incomplete = not summary["complete"]
-    notes = (f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
+    notes = ("V2 only: service/author_id/[post_id]title; media and previews are post-local.\n\n"
+             + f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
              f"Processed {len(posts)} favourite posts. Metadata saved: {totals['metadata_saved']}. "
              f"Original downloads: {totals['original_saved']}; previews: {totals['preview_saved']}.\n\n"
              "Download every favorites.tar.xz.partNNNNN, concatenate in numeric order, then extract tar.xz. "
@@ -613,7 +637,7 @@ def assemble(staging_id, staging_tag):
              "Account credentials, cookies and favourite sequence fields are excluded.")
     gh("api", f"repos/{repo()}/releases/{release_id}", "--method", "PATCH",
        "-F", "draft=false", "-F", f"prerelease={str(incomplete).lower()}",
-       "-f", f"name=Favourite Posts · {len(posts)} posts" + (" · INCOMPLETE" if incomplete else ""),
+       "-f", f"name=Favourite Posts V2 · {len(posts)} posts" + (" · INCOMPLETE" if incomplete else ""),
        "-f", f"body={notes}")
     print(f"RELEASE_URL=https://github.com/{repo()}/releases/tag/{tag}", flush=True)
     emit(release_url=f"https://github.com/{repo()}/releases/tag/{tag}")

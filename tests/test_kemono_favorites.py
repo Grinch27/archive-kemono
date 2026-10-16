@@ -26,6 +26,25 @@ def post(number):
 
 
 class FavoritesTests(unittest.TestCase):
+    def test_v2_archive_member_gate(self):
+        allowed = {"fanbox/a123/[p456]Title"}
+        for member in (
+                "fanbox/a123/[p456]Title/post.json",
+                "fanbox/a123/[p456]Title/status.json",
+                "fanbox/a123/[p456]Title/media/image__abcd.jpg",
+                "fanbox/a123/[p456]Title/previews/image__abcd.webp"):
+            app.require_v2_member(member, allowed)
+        for member in (
+                "posts/fanbox/a123/p456/status.json",
+                "media/image.jpg",
+                "previews/image.jpg",
+                "archive-summary.json",
+                "fanbox/a123/[p457]Unknown/post.json",
+                "fanbox/a123/[p456]Title/media/deep/file.jpg",
+                "fanbox/a123/[p456]Title/future.bin"):
+            with self.subTest(member=member), self.assertRaises(ValueError):
+                app.require_v2_member(member, allowed)
+
     def test_restore_newest_published_v2_registry_across_modes(self):
         frozen = app.layout.FrozenLayout()
         first = frozen.plan("fantia", "a1", "p1", "First title")
@@ -120,7 +139,7 @@ class FavoritesTests(unittest.TestCase):
         seen = {}
         with io.BytesIO() as result:
             with tarfile.open(fileobj=result, mode="w|") as archive:
-                item = tarfile.TarInfo("media/fixture")
+                item = tarfile.TarInfo("fanbox/fixture/[0]Synthetic/media/fixture")
                 item.size = 3
                 app.copy_member(archive, item, io.BytesIO(b"abc"), seen)
                 app.copy_member(archive, item, io.BytesIO(b"abc"), seen)
@@ -128,7 +147,7 @@ class FavoritesTests(unittest.TestCase):
                     app.copy_member(archive, item, io.BytesIO(b"def"), seen)
             result.seek(0)
             with tarfile.open(fileobj=result) as archive:
-                self.assertEqual(archive.getnames(), ["media/fixture"])
+                self.assertEqual(archive.getnames(), ["fanbox/fixture/[0]Synthetic/media/fixture"])
         for name in ("../x", "/abs", "a\\b", "a\nx"):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 app.safe_member(tarfile.TarInfo(name))

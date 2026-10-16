@@ -81,7 +81,7 @@ class ArchiveTests(unittest.TestCase):
             with gzip.GzipFile(fileobj=writer, mode="wb", mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w|") as archive:
                     app.add_json(archive, "metadata/profile.json", {"post_count": 1})
-                    entry = tarfile.TarInfo("media/fixture.bin")
+                    entry = tarfile.TarInfo("fanbox/fixture/[42]Synthetic/media/fixture.bin")
                     entry.size = len(payload)
                     archive.addfile(entry, io.BytesIO(payload))
             writer.finish()
@@ -89,7 +89,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertTrue(all(size <= 200 for size in sizes))
             self.assertEqual(list(Path(temp).iterdir()), [])
             with tarfile.open(fileobj=io.BytesIO(b"".join(parts)), mode="r:gz") as archive:
-                self.assertEqual(archive.extractfile("media/fixture.bin").read(), payload)
+                self.assertEqual(archive.extractfile("fanbox/fixture/[42]Synthetic/media/fixture.bin").read(), payload)
                 self.assertEqual(json.load(archive.extractfile("metadata/profile.json")), {"post_count": 1})
 
     def test_exact_boundary_does_not_add_empty_part(self):

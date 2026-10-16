@@ -1,7 +1,7 @@
 # 待确认：被检查的暂存Release；歧义：下载次数不等于去重后的媒体数量。
 # 后续研究：仅在需要时核查失败类别；潜在优化：无。
-# 风险：云端解压一个样本批次做校验，不输出原文；仅做可信官方HTTPS路径HEAD，不自动换源。
-# 验证重点：只读、计数、权限隔离、gzip完整性、原件失败码及HEAD时序。
+# 风险：仅手动检查V2暂存批次；push只执行离线回归，不扫描任何历史V1 Release。
+# 验证重点：V2-only批次和路径、计数、权限隔离、gzip完整性、原件失败码及HEAD时序。
 name: Favourite archive inspect
 on:
   push:
@@ -12,7 +12,6 @@ on:
       release_id:
         description: "暂存Release ID"
         type: string
-        default: "413942089"
         required: true
 permissions: write-all
 env:
@@ -48,11 +47,12 @@ jobs:
       - name: Run offline regression tests
         shell: bash
         run: python3 -m unittest discover -s tests -q -b
-      - name: Read completed batch counters
+      - name: Read completed V2 batch counters
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          STAGING_ID: ${{ inputs.release_id || '413942089' }}
+          STAGING_ID: ${{ inputs.release_id }}
         run: |
           python3 -u - <<'PY'
           import collections
@@ -67,32 +67,39 @@ jobs:
           sys.path.insert(0, 'scripts')
           import kemono_favorites as app
           release_id = int(os.environ['STAGING_ID'])
+          registry = app.layout.FrozenLayout.from_dict(app.download_json_asset(release_id, 'layout-registry.json'))
+          targets = app.download_json_asset(release_id, 'targets.json')
           totals, count, sample = collections.Counter(), 0, None
           for item in sorted(app.assets(release_id), key=lambda x: x['name']):
               if not re.fullmatch(r'batch-[0-9]{5}\.json', item['name']):
                   continue
               batch = app.gh('api', f"repos/{app.repo()}/releases/assets/{item['id']}",
                              '-H', 'Accept: application/octet-stream')
+              if batch.get('schema_version') != app.layout.VERSION:
+                  raise ValueError('V1 batch manifests unsupported; V2 only')
               counts = batch['counts']
               if any(not isinstance(v, int) or v < 0 for v in counts.values()):
                   raise ValueError('invalid archive counters')
               totals.update(counts)
               count += 1
-              if batch['index'] == 4:
+              if sample is None:
                   sample = batch
           print('ARCHIVE_COUNTERS=' + json.dumps({'completed_batches': count, **totals}, sort_keys=True))
           if sample:
               codes, members = collections.Counter(), collections.Counter()
               head_url = None
+              allowed = {registry.favourite_post(item).relative
+                         for item in targets[sample['index'] * app.BATCH_SIZE:(sample['index'] + 1) * app.BATCH_SIZE]}
               reader = app.PartReader(sample['parts'])
               try:
                   with gzip.GzipFile(fileobj=reader, mode='rb') as compressed:
                       with tarfile.open(fileobj=compressed, mode='r|') as archive:
                           for member in archive:
                               app.safe_member(member)
-                              if member.name.startswith('media/'):
+                              app.require_v2_member(member.name, allowed)
+                              if '/media/' in member.name:
                                   members['original_files'] += 1
-                              if member.name.startswith('previews/'):
+                              if '/previews/' in member.name:
                                   members['preview_files'] += 1
                               if member.name.endswith('/status.json'):
                                   with archive.extractfile(member) as source:

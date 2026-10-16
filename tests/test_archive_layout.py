@@ -1,6 +1,6 @@
 # 待确认：全部 Favourite Artist 枚举帖子的未知标题、不同 service 的实际媒体文件名。
 # 歧义：独立空白注册表无法协调互相冲突的标题；同一持久化注册表可以冻结规范名称。
-# 后续研究：完整多卷重组、新旧状态索引迁移和最终云端产物路径核验。
+# 后续研究：完整多卷重组、V2 冻结注册表校验和最终云端产物路径核验。
 # 潜在优化：真实大量作者和帖子对注册表加载及哈希冲突的压力测试。
 # 风险：不得向公共输出复制真实收藏正文或标题；仅输出聚合测试计数。
 # 验证重点：身份唯一、跨模式共享、恢复、Unicode、Windows 安全、媒体归属、未知数据失败、TAR 校验。
@@ -107,6 +107,20 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaises(layout.LayoutError):
             layout.FrozenLayout.from_dict(r)
         self.assertTrue(p.relative)
+
+    def test_v1_and_mismatched_layout_registry_rejected(self):
+        legacy = self.registry.to_dict()
+        legacy["schema_version"] = 1
+        with self.assertRaises(layout.LayoutError):
+            layout.FrozenLayout.from_dict(legacy)
+        legacy = self.registry.to_dict()
+        legacy["layout"] = "posts/service/author_id/post_id"
+        with self.assertRaises(layout.LayoutError):
+            layout.FrozenLayout.from_dict(legacy)
+        legacy = self.registry.to_dict()
+        del legacy["layout"]
+        with self.assertRaises(layout.LayoutError):
+            layout.FrozenLayout.from_dict(legacy)
 
     def test_mismatched_artist_post_does_not_mutate_registry(self):
         with self.assertRaises(layout.LayoutError):

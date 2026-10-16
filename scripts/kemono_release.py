@@ -465,7 +465,7 @@ def main():
         (temp / "release-notes.md").write_text(notes + "\n", encoding="utf-8")
         (temp / "layout-registry.json").write_text(
             json.dumps(registry.to_dict(), ensure_ascii=False) + "\n", encoding="utf-8")
-        title = f"{service}/{user} · {len(posts)} posts" + (" · sample" if limit else "")
+        title = f"{service}/{user} · V2 · {len(posts)} posts" + (" · sample" if limit else "")
         title += " · INCOMPLETE" if failures else ""
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"title={title}\nincomplete={str(bool(failures)).lower()}\n")

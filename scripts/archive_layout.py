@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # 待确认：真实 Favourite Artists 全量帖子的标题分布、永久路径注册表的私有存储位置。
 # 歧义：首次归档时若各来源的标题不一致，以首次成功登记的标题作为冻结值；不承诺不同空白注册表独立规划结果一致。
-# 后续研究：发布后的 registry 迁移、Windows 解压绝对路径长度、已存在旧版资产的媒体重用。
+# 后续研究：V2 冻结注册表完整性核验、Windows 解压路径长度与长期备份策略。
 # 潜在优化：注册表较大时按作者分片；当前先保留标准库、可复核、确定性逻辑。
 # 风险：目录名可能包含敏感标题；注册表是私有资产；不得未经授权提交到公开 Git 历史。
 # 验证重点：真实快照、Unicode、DOS 保留名、大小写冲突、路径长度、冻结后标题变化、跨来源同一帖子复用。
@@ -236,7 +236,9 @@ class FrozenLayout:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "FrozenLayout":
-        if not isinstance(data, dict) or data.get("schema_version") != VERSION or not isinstance(data.get("posts"), list) or not isinstance(data.get("authors"), list):
+        if (not isinstance(data, dict) or data.get("schema_version") != VERSION
+                or data.get("layout") != "service/author_id/[post_id]title"
+                or not isinstance(data.get("posts"), list) or not isinstance(data.get("authors"), list)):
             raise LayoutError("invalid V2 registry")
         registry = cls()
         for author in data["authors"]:
