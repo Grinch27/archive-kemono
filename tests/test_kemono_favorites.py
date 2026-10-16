@@ -26,6 +26,21 @@ def post(number):
 
 
 class FavoritesTests(unittest.TestCase):
+    def test_restore_newest_published_v2_registry_across_modes(self):
+        frozen = app.layout.FrozenLayout()
+        first = frozen.plan("fantia", "a1", "p1", "First title")
+        releases = [
+            {"tag_name": "kemono-favorites-staging-22-1", "draft": True,
+             "id": 2, "assets": [{"name": "layout-registry.json"}]},
+            {"tag_name": "kemono-fantia-a1-12-1", "draft": False,
+             "id": 12, "assets": [{"name": "layout-registry.json"}]},
+        ]
+        with patch.object(app, "gh", return_value=releases), patch.object(
+                app, "download_json_asset", return_value=frozen.to_dict()) as downloaded:
+            restored = app.load_latest_layout()
+        self.assertEqual(restored.plan("fantia", "a1", "p1", "Changed title"), first)
+        downloaded.assert_called_once_with(12, "layout-registry.json")
+
     def test_baseline_accepts_additions_but_rejects_missing_changed_and_duplicate(self):
         source = post(1)
         baseline = {"posts": {app.digest(app.key(source)): app.digest(app.clean(source))}}

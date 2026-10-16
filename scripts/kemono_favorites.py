@@ -167,8 +167,9 @@ def load_latest_layout():
     if not isinstance(previous, list):
         raise RuntimeError("invalid releases listing")
     for release in previous:
-        if release.get("draft") or not release.get("tag_name", "").startswith(
-                ("kemono-favorites-archive-", "kemono-patreon-", "kemono-fanbox-")):
+        tag = release.get("tag_name", "")
+        if release.get("draft") or not isinstance(tag, str) or not re.fullmatch(
+                r"(?:kemono-favorites-archive-[0-9]+-[0-9]+|kemono-[a-z0-9_-]+-[A-Za-z0-9_-]+-[0-9]+-[0-9]+)", tag):
             continue
         present = [a for a in release.get("assets", []) if a.get("name") == "layout-registry.json"]
         if present:
