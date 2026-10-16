@@ -265,6 +265,7 @@ for number in (1, 2):
     assert sys.stdin.readline().strip() == path.name
     path.unlink()
 (folder/"archive-manifest.json").write_text("{}")
+(folder/"layout-registry.json").write_text('{"schema_version": 2, "posts": [], "authors": []}')
 (folder/"release-notes.md").write_text("fixture notes")
 (Path(os.environ["RUNNER_TEMP"])/"failed-files.json").write_text("{}")
 '''
@@ -315,6 +316,7 @@ elif args[0] == "api":
                 if mode != "producer_failure":
                     self.assertTrue(list((root/"kemono-archive").glob("*.part*")))
 
+    # V2: identical original URLs on different posts remain separate, independently verifiable files.
     def exercise_main(self, fail, compression="xz", upload_error=False, fallback=None, missing_node=False):
         assets, calls = {}, []
         class Api:
@@ -352,10 +354,10 @@ elif args[0] == "api":
                 if upload_error:
                     with self.assertRaises(RuntimeError): app.main()
                     self.assertFalse((Path(temp)/"kemono-archive/archive-manifest.json").exists())
-                    self.assertEqual(len(json.loads((Path(temp)/"failed-files.json").read_text())["files"]), 1)
+                    self.assertEqual(len(json.loads((Path(temp)/"failed-files.json").read_text())["files"]), 2)
                     return
                 app.main()
-            self.assertEqual(len(calls), 2 + int(fail and fallback is not None) - int(missing_node))
+            self.assertEqual(len(calls), 3 + 2 * int(fail and fallback is not None) - 2 * int(missing_node))
             self.assertEqual(sum("/thumbnail/data/" in url for url in calls), int(fail and fallback is not None))
             result_dir = Path(temp)/"kemono-archive"
             manifest = json.loads((result_dir/"archive-manifest.json").read_text())
@@ -363,9 +365,9 @@ elif args[0] == "api":
             self.assertIn(f"incomplete={str(fail).lower()}", (Path(temp)/"outputs").read_text())
             self.assertFalse(hasattr(app, "Release"))
             self.assertFalse(list(result_dir.glob("*.part*")))
-            self.assertEqual(manifest["file_count"], 1 + int(not fail or fallback is True))
-            self.assertEqual(manifest["original_bytes"], 8 if fail else 16)
-            self.assertEqual(manifest["failed_file_count"], int(fail))
+            self.assertEqual(manifest["file_count"], 1 + (0 if fail else 2) + (2 if fail and fallback is True else 0))
+            self.assertEqual(manifest["original_bytes"], 8 if fail else 24)
+            self.assertEqual(manifest["failed_file_count"], 2 * int(fail))
             self.assertEqual(manifest["complete"], not fail)
             self.assertEqual(manifest["media_complete"], not fail)
             parts = b"".join(assets[p["name"]] for p in manifest["assets"])
@@ -378,8 +380,8 @@ elif args[0] == "api":
                     item = failures["files"][0]
                     self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 0 if missing_node else 1, 3, 0 if missing_node else 28))
                     self.assertFalse(any(name.startswith("fanbox/56018056/[1]/media/") for name in archive.getnames()))
-                    self.assertEqual(manifest["preview_file_count"], int(fallback is True))
-                    self.assertEqual(manifest["preview_bytes"], 8 if fallback is True else 0)
+                    self.assertEqual(manifest["preview_file_count"], 2 * int(fallback is True))
+                    self.assertEqual(manifest["preview_bytes"], 16 if fallback is True else 0)
                     if fallback is True:
                         self.assertEqual(archive.extractfile(item["preview_archive_path"]).read(), b"original")
                         self.assertTrue(item["preview_archive_path"].startswith("fanbox/56018056/[1]/previews/"))
