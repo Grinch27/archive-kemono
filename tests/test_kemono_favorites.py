@@ -27,21 +27,21 @@ def post(number):
 
 class FavoritesTests(unittest.TestCase):
     def test_v2_archive_member_gate(self):
-        allowed = {"fanbox/a123/p456_p001"}
+        allowed = {"fanbox/a123/[p456]Title"}
         for member in (
-                "fanbox/a123/p456_p001/post.json",
-                "fanbox/a123/p456_p001/status.json",
-                "fanbox/a123/p456_p001/media/image__abcd.jpg",
-                "fanbox/a123/p456_p001/previews/image__abcd.webp"):
+                "fanbox/a123/[p456]Title/post.json",
+                "fanbox/a123/[p456]Title/status.json",
+                "fanbox/a123/[p456]Title/media/image__abcd.jpg",
+                "fanbox/a123/[p456]Title/previews/image__abcd.webp"):
             app.require_v2_member(member, allowed)
         for member in (
                 "posts/fanbox/a123/p456/status.json",
                 "media/image.jpg",
                 "previews/image.jpg",
                 "archive-summary.json",
-                "fanbox/a123/p457_p001/post.json",
-                "fanbox/a123/p456_p001/media/deep/file.jpg",
-                "fanbox/a123/p456_p001/future.bin"):
+                "fanbox/a123/[p457]Unknown/post.json",
+                "fanbox/a123/[p456]Title/media/deep/file.jpg",
+                "fanbox/a123/[p456]Title/future.bin"):
             with self.subTest(member=member), self.assertRaises(ValueError):
                 app.require_v2_member(member, allowed)
 
@@ -94,19 +94,40 @@ class FavoritesTests(unittest.TestCase):
                              '<a href="https://example.invalid/ordinary">link</a>')
         detail = {"post": {}, "previews": [{"path": "/a/original.jpg", "type": "thumbnail", "server": "https://n1.kemono.cr"}]}
         refs = app.references(source, detail)
-        self.assertEqual(refs[0]["url"], "https://n1.kemono.cr/data/a/original.jpg")
-        self.assertIn("preview_url", refs[0])
+        cover = next(r for r in refs if r.get("path") == "/a/original.jpg")
+        self.assertEqual(cover["url"], "https://n1.kemono.cr/data/a/original.jpg")
+        self.assertIn("preview_url", cover)
+        self.assertEqual(refs[0]["state"], "unsupported_source")
         self.assertTrue(any(r["state"] == "unsupported_source" for r in refs))
         self.assertTrue(any(r["raw"] == "/a/video.mp4" for r in refs))
         self.assertFalse(any("ordinary" in r["raw"] for r in refs))
+
+    def test_mixed_image_video_dom_order_and_duplicate_positions(self):
+        source = post(1)
+        source["file"] = {"path": "/a/cover.jpg"}
+        source["content"] = '<img src="/a/one.png"><video><source src="/a/clip.mp4"></video>'
+        source["attachments"] = [{"path": "/a/last.webp"}]
+        refs = app.layout.media_positions(app.references(source, {
+            "post": dict(source),
+            "attachments": [{"path": "/a/one.png", "server": "https://n1.kemono.cr"}],
+            "videos": [{"path": "/a/clip.mp4", "server": "https://n1.kemono.cr"}]}))
+        unique = {}
+        for record in refs:
+            if record.get("path") and record["path"] not in unique:
+                unique[record["path"]] = record["page_position"]
+        self.assertEqual(list(unique.items()),
+                         [("/a/cover.jpg", 1), ("/a/one.png", 2),
+                          ("/a/clip.mp4", 3), ("/a/last.webp", 4)])
+        self.assertEqual({r["page_media_total"] for r in refs}, {4})
 
     def test_unsafe_paths_and_preview_urls_are_not_originals(self):
         source = {**post(1), "attachments": [{"path": "/../secret"}],
                   "content": '<img src="https://img.kemono.cr/thumbnail/data/a/image.jpg">'}
         refs = app.references(source, {})
-        self.assertEqual(refs[0]["state"], "unsafe_reference")
-        self.assertIsNone(refs[1]["url"])
-        self.assertIn("preview_url", refs[1])
+        self.assertTrue(any(r["state"] == "unsafe_reference" for r in refs))
+        preview = next(r for r in refs if r.get("preview_url"))
+        self.assertIsNone(preview["url"])
+        self.assertIn("preview_url", preview)
 
     def test_redirect_is_validated_before_second_request_and_tokens_are_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -240,8 +261,8 @@ class FavoritesTests(unittest.TestCase):
             with tarfile.open(fileobj=io.BytesIO(compressed), mode="r:xz") as archive:
                 self.assertEqual(sum("/media/" in n for n in archive.getnames()), 3)
                 self.assertEqual(sum(n.endswith("/snapshot.json") for n in archive.getnames()), 3)
-                self.assertEqual(archive.extractfile("fanbox/fixture/0_p01/content.html").read().decode(), "合成正文")
-                self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/0_p01/snapshot.json").read())
+                self.assertEqual(archive.extractfile("fanbox/fixture/[0]合成标题/content.html").read().decode(), "合成正文")
+                self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/[0]合成标题/snapshot.json").read())
             self.assertEqual(len(publications), 1)
             self.assertIn("draft=false", publications[0])
 

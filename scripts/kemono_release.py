@@ -87,31 +87,42 @@ def canonical_path(path):
 
 
 def file_references(detail):
+    """Collect visible page media in order, independent of image/video file type."""
     post = detail["post"]
     resolved = {}
     thumbnails = {canonical_path(p["path"]) for p in detail.get("previews") or []
                   if isinstance(p, dict) and p.get("path") and p.get("type") == "thumbnail"}
-    for item in [*(detail.get("attachments") or []), *(detail.get("previews") or []), *(detail.get("videos") or [])]:
+    for item in [*(detail.get("attachments") or []), *(detail.get("previews") or []),
+                 *(detail.get("videos") or [])]:
         if isinstance(item, dict) and item.get("path") and item.get("server"):
             resolved[canonical_path(item["path"])] = item["server"]
-    refs = [post.get("file"), post.get("shared_file"), *(post.get("attachments") or []),
-            *(detail.get("attachments") or []), *(detail.get("videos") or [])]
     result = {}
-    for item in refs:
-        if not isinstance(item, dict) or not item.get("path"):
-            continue
-        path = canonical_path(item["path"])
-        server = item.get("server") or resolved.get(path)
+    for entry in layout.page_media_entries(post, detail):
+        raw = entry["raw"]
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme or parsed.netloc:
+            # External embeds remain in content.html; never send account cookies off-site.
+            if not media_host(raw) or parsed.query or parsed.fragment:
+                continue
+            path = canonical_path(parsed.path)
+            direct_url = raw
+        else:
+            path = canonical_path(raw)
+            direct_url = None
+        server = resolved.get(path)
         if server:
-            p = urllib.parse.urlsplit(server)
-            if not media_host(server) or p.path not in ("", "/") or p.query or p.fragment:
+            parsed_server = urllib.parse.urlsplit(server)
+            if (not media_host(server) or parsed_server.path not in ("", "/")
+                    or parsed_server.query or parsed_server.fragment):
                 raise RuntimeError("下载节点不是可信基址")
         quoted = urllib.parse.quote(path, safe="/")
-        result[path] = {"path": path, "name": item.get("name"),
-                        "url": server.rstrip("/") + "/data" + quoted if server else None,
-                        "preview_url": "https://img.kemono.cr/thumbnail/data" + quoted if path in thumbnails else None}
-    return list(result.values())
-
+        if path not in result:
+            result[path] = {
+                "path": path, "name": entry.get("name"),
+                "url": direct_url or (server.rstrip("/") + "/data" + quoted if server else None),
+                "preview_url": "https://img.kemono.cr/thumbnail/data" + quoted if path in thumbnails else None,
+            }
+    return layout.media_positions(list(result.values()))
 
 class Api:
     def __init__(self):
@@ -356,9 +367,8 @@ def main():
     registry = (layout.FrozenLayout.from_dict(json.loads(Path(registry_file).read_text()))
                 if registry_file else layout.FrozenLayout())
     registry.author(service, user)
-    planned_posts = [registry.plan(service, user, entry["id"], entry.get("title"),
-                                   position=index, total_posts=len(posts))
-                     for index, entry in enumerate(posts, 1)]
+    planned_posts = [registry.plan(service, user, entry["id"], entry.get("title"))
+                     for entry in posts]
     author_prefix = registry.author(service, user)
     temp = Path(os.environ["RUNNER_TEMP"]) / "kemono-archive"
     temp.mkdir(exist_ok=False)
@@ -418,7 +428,9 @@ def main():
                                 save_failures(failure_path, source, failures)
                                 continue
                         try:
-                            name = planned.media_member(item["path"], preview=(kind == "preview"))
+                            name = planned.media_member(
+                                item["path"], position=item["page_position"],
+                                total_media=item["page_media_total"], preview=(kind == "preview"))
                             info = tarfile.TarInfo(name)
                             info.size, info.mode, info.mtime = media.size, 0o644, 0
                             archive.addfile(info, media)

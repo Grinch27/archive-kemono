@@ -9,7 +9,6 @@ import argparse
 import contextlib
 import gzip
 import hashlib
-from html.parser import HTMLParser
 import io
 import json
 import lzma
@@ -190,8 +189,8 @@ def inventory():
     if {digest(key(p)): digest(p) for p in posts} != {digest(key(p)): digest(p) for p in again}:
         raise RuntimeError("favorites changed during inventory; retry with a stable target list")
     registry = load_latest_layout()
-    for position, post in enumerate(posts, 1):
-        registry.favourite_post(post, position=position, total_posts=len(posts))
+    for post in posts:
+        registry.favourite_post(post)
     stamp = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     tag = "kemono-favorites-staging-" + stamp
     release_id = create_draft(tag, "Private staging for favorites " + stamp)
@@ -207,26 +206,6 @@ def inventory():
     print(f"Frozen targets: {len(posts)}; historical baseline: {len(baseline['posts'])}; batches: {count}")
     emit(staging_id=release_id, staging_tag=tag, matrix=json.dumps(list(range(count))),
          target_count=len(posts), batch_count=count)
-
-
-class HtmlMedia(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.urls = []
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag not in ("img", "source", "video", "audio"):
-            return
-        for name in ("src", "data-src", "poster"):
-            if attrs.get(name):
-                self.urls.append(attrs[name])
-        for name in ("srcset", "data-srcset"):
-            value = attrs.get(name, "")
-            if value.startswith("data:"):
-                self.urls.append(value)
-            else:
-                self.urls.extend(x.strip().split()[0] for x in value.split(",") if x.strip())
 
 
 def references(snapshot, detail):
@@ -247,17 +226,8 @@ def references(snapshot, detail):
                     resolved[path] = server.rstrip("/")
             if item.get("type") == "thumbnail":
                 thumbnails.add(path)
-    refs = []
-    for source in (snapshot, post):
-        for item in [source.get("file"), source.get("shared_file"), *(source.get("attachments") or [])]:
-            if isinstance(item, dict) and item.get("path"):
-                refs.append({"raw": item["path"], "field": "attachment", "name": item.get("name")})
-        parser = HtmlMedia()
-        parser.feed(source.get("content") or "")
-        refs.extend({"raw": url, "field": "html"} for url in parser.urls)
-    for item in nodes:
-        if isinstance(item, dict) and item.get("path") and item.get("type") != "thumbnail":
-            refs.append({"raw": item["path"], "field": "detail"})
+    refs = layout.page_media_entries(snapshot)
+    refs.extend(layout.page_media_entries(post, detail))
     for ref in refs:
         raw = ref["raw"]
         try:
@@ -423,7 +393,7 @@ def batch(index, staging_id, staging_tag):
                 detail = {}
                 detail_error = "detail_unavailable"
                 counts["detail_failed"] += 1
-            records = references(snapshot, detail)
+            records = layout.media_positions(references(snapshot, detail))
             for record in records:
                 if record["state"] != "pending":
                     counts["missing_originals"] += 1
@@ -438,7 +408,14 @@ def batch(index, staging_id, staging_tag):
                         continue
                     try:
                         with download(url, directory, image_only=kind == "preview") as path:
-                            name = planned.media_member(record["path"], preview=(kind == "preview"))
+                            suffix = ".jpg"
+                            if kind == "preview":
+                                with path.open("rb") as probe:
+                                    suffix = layout.preview_image_suffix(probe.read(32))
+                            name = planned.media_member(
+                                record["path"], position=record["page_position"],
+                                total_media=record["page_media_total"],
+                                preview=(kind == "preview"), preview_suffix=suffix)
                             info = tarfile.TarInfo(name)
                             info.size, info.mode, info.mtime = path.stat().st_size, 0o644, 0
                             with path.open("rb") as source:
@@ -623,7 +600,7 @@ def assemble(staging_id, staging_tag):
     save_json(summary_path, summary)
     upload(tag, release_id, summary_path)
     incomplete = not summary["complete"]
-    notes = ("V2 only: service/author_id/post_id_pNNNNN; media and previews are post-local.\n\n"
+    notes = ("V2 only: service/author_id/[post_id]title; post media use post_id_pNNN in page order.\n\n"
              + f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
              f"Processed {len(posts)} favourite posts. Metadata saved: {totals['metadata_saved']}. "
              f"Original downloads: {totals['original_saved']}; previews: {totals['preview_saved']}.\n\n"

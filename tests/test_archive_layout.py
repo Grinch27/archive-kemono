@@ -29,26 +29,26 @@ class LayoutTests(unittest.TestCase):
         self.registry = layout.FrozenLayout()
 
     def test_three_level_paths_and_no_title(self):
-        p = self.registry.plan("fanbox", "123", "999", " hello / world ", position=1, total_posts=1289)
-        self.assertEqual(p.relative, "fanbox/123/999_p00001")
-        self.assertEqual(self.registry.plan("fanbox", "123", "1000", None, position=2, total_posts=1289).relative, "fanbox/123/1000_p00002")
+        p = self.registry.plan("fanbox", "123", "999", " hello / world ")
+        self.assertEqual(p.relative, "fanbox/123/[999]hello _ world")
+        self.assertEqual(self.registry.plan("fanbox", "123", "1000", None).relative, "fanbox/123/[1000]")
         self.assertEqual(p.member("content.html"), p.relative + "/content.html")
 
     def test_first_title_is_frozen_through_reload_and_artist_mode(self):
-        first = self.registry.favourite_post({"service":"patreon", "user":"406", "id":"987", "title":"Original"}, position=1, total_posts=1289)
+        first = self.registry.favourite_post({"service":"patreon", "user":"406", "id":"987", "title":"Original"})
         data = self.registry.to_dict()
         loaded = layout.FrozenLayout.from_dict(json.loads(json.dumps(data)))
         later = loaded.artist_post({"service":"patreon", "id":"406"},
                                    {"service":"patreon", "user":"406", "id":"987", "title":"Renamed and changed"})
         self.assertEqual(first, later)
-        self.assertEqual(first.relative, "patreon/406/987_p00001")
+        self.assertEqual(first.relative, "patreon/406/[987]Original")
 
     def test_windows_case_collisions_of_post_ids(self):
-        a = self.registry.plan("fanbox", "user", "Ab", "A", position=1, total_posts=20)
-        b = self.registry.plan("fanbox", "user", "ab", "a", position=1, total_posts=20)
+        a = self.registry.plan("fanbox", "user", "Ab", "A")
+        b = self.registry.plan("fanbox", "user", "ab", "a")
         self.assertNotEqual(layout._portable_key(a.relative),layout._portable_key(b.relative))
-        self.assertEqual(a.folder, "Ab_p001")
-        self.assertEqual(b.folder, "ab_p002")
+        self.assertTrue(b.folder.startswith("[ab]"))
+        self.assertIn("__", b.folder)
         loaded = layout.FrozenLayout.from_dict(self.registry.to_dict())
         self.assertEqual(loaded.plan("fanbox", "user", "ab", "later title"),b)
 
@@ -59,9 +59,9 @@ class LayoutTests(unittest.TestCase):
 
     def test_unicode_and_windows_filename_safety(self):
         x = self.registry.plan("fanbox","A1","B2", '  e\u0301 / < > : " \\ | ? * \u202etest.  ')
-        self.assertEqual(x.folder, "B2_p01")
-        self.assertEqual(layout._clean_text(" e\u0301 "), "é")
-        self.assertNotIn("/", x.folder)
+        self.assertIn("é",x.folder)
+        self.assertNotIn("/",x.folder)
+        self.assertTrue(x.folder.endswith("test"))
         self.assertEqual(layout._clean_text("\u200b"),"")
         with self.assertRaises(layout.LayoutError):
             self.registry.plan("fanbox","CON","1","bad")
@@ -72,26 +72,52 @@ class LayoutTests(unittest.TestCase):
         p = self.registry.plan("fantia", "A", "999", "图" * 200)
         self.assertLessEqual(len(p.folder.encode("utf-8")),layout.MAX_POST_COMPONENT_BYTES)
         self.assertLessEqual(len(p.relative.encode("utf-8")),layout.MAX_POST_RELATIVE_BYTES)
-        self.assertEqual(p.folder, "999_p01")
         self.assertEqual(p.folder, p.folder.encode("utf-8").decode("utf-8"))
 
-    def test_sequence_width_has_one_extra_zero_digit(self):
-        self.assertEqual(layout.serial_width(1), 2)
-        self.assertEqual(layout.serial_width(9), 2)
-        self.assertEqual(layout.serial_width(10), 3)
-        self.assertEqual(layout.serial_width(25), 3)
-        self.assertEqual(layout.serial_width(1289), 5)
-        self.assertEqual(layout.serial_width(10000), 6)
-        for count in (0, -1, True, "25", 1.0):
-            with self.assertRaises(layout.LayoutError):
-                layout.serial_width(count)
+    def test_page_media_images_and_videos_share_one_ordered_sequence(self):
+        post = {"file": {"path": "/a/cover.jpg"},
+                "content": ('<img src="/a/first.png"><video><source src="/a/clip.mp4"></video>'
+                            '<img src="/a/third.webp">'),
+                "attachments": [{"path": "/a/last.gif"}]}
+        entries = layout.page_media_entries(post)
+        self.assertEqual([x["raw"] for x in entries],
+                         ["/a/cover.jpg", "/a/first.png", "/a/clip.mp4", "/a/third.webp", "/a/last.gif"])
+        ordered = layout.media_positions(
+            [{"path": x["raw"]} for x in entries] + [{"path": "/a/clip.mp4"}])
+        self.assertEqual([x["page_position"] for x in ordered], [1, 2, 3, 4, 5, 3])
+        self.assertEqual({x["page_media_total"] for x in ordered}, {5})
+        p = self.registry.plan("fanbox", "123", "987654", "Some title")
+        self.assertEqual(p.media_member("/a/cover.jpg", position=1, total_media=5),
+                         p.relative + "/media/987654_p01.jpg")
+        self.assertEqual(p.media_member("/a/clip.mp4", position=3, total_media=5),
+                         p.relative + "/media/987654_p03.mp4")
+        self.assertEqual(p.media_member("/a/clip.mp4", position=3, total_media=5, preview=True),
+                         p.relative + "/previews/987654_p03.jpg")
 
-    def test_sequence_is_frozen_even_when_total_grows(self):
-        first = self.registry.plan("fanbox", "12", "900", "First title", position=1, total_posts=25)
-        self.assertEqual(first.folder, "900_p001")
-        latest = layout.FrozenLayout.from_dict(self.registry.to_dict())
-        self.assertEqual(latest.plan("fanbox", "12", "900", "Renamed", position=15, total_posts=1289), first)
-        self.assertEqual(latest.plan("fanbox", "12", "901", "", position=26, total_posts=1289).folder, "901_p00026")
+    def test_video_poster_and_alternative_sources_share_one_page_slot(self):
+        source = {
+            "content": ('<picture><source srcset="/a/webp.webp 1x"><img src="/a/full.jpg"></picture>'
+                        '<video poster="/a/poster.jpg"><source src="/a/movie.mp4">'
+                        '<source src="/a/movie.webm"></video>'
+                        '<img src="/a/second.png">'),
+        }
+        entries = layout.page_media_entries(source)
+        self.assertEqual([x["raw"] for x in entries],
+                         ["/a/full.jpg", "/a/movie.mp4", "/a/second.png"])
+
+    def test_media_padding_depends_on_media_in_post_not_number_of_posts(self):
+        p = self.registry.plan("patreon", "42", "abc", "Mixed")
+        self.assertEqual(p.media_member("/a/one.jpg", position=1, total_media=9).split("/")[-1],
+                         "abc_p01.jpg")
+        self.assertEqual(p.media_member("/a/one.jpg", position=1, total_media=25).split("/")[-1],
+                         "abc_p001.jpg")
+        self.assertEqual(p.media_member("/a/movie.mp4", position=128, total_media=128).split("/")[-1],
+                         "abc_p0128.mp4")
+        for position,total in ((0,2),(3,2),(1,0),(True,1)):
+            with self.subTest(position=position,total=total), self.assertRaises(layout.LayoutError):
+                p.media_member("/a/file.png", position=position, total_media=total)
+        self.assertEqual(layout.preview_image_suffix(b"\xff\xd8\xfffixture"), ".jpg")
+        self.assertEqual(layout.preview_image_suffix(b"\x89PNG\r\n\x1a\n"), ".png")
 
     def test_very_long_identifier_is_rejected(self):
         with self.assertRaises(layout.LayoutError):
@@ -103,17 +129,19 @@ class LayoutTests(unittest.TestCase):
         p = self.registry.plan("patreon", "12", "13", "Hello")
         q = self.registry.artist_post({"service":"patreon","id":"12"},
             {"service":"patreon","user":"12","id":"13","title":"Changed"})
-        original = p.media_member("/data/a/b/image.PNG")
-        self.assertEqual(original,q.media_member("/data/a/b/image.PNG"))
+        original = p.media_member("/data/a/b/image.PNG", position=1, total_media=1)
+        self.assertEqual(original,q.media_member("/data/a/b/image.PNG", position=1, total_media=1))
+        self.assertTrue(original.endswith("/13_p01.png"))
         self.assertTrue(original.startswith(p.relative+"/media/"))
-        self.assertTrue(p.media_member("/data/a/b/image.PNG",preview=True).startswith(p.relative+"/previews/"))
-        self.assertNotEqual(original,p.media_member("/data/a/b/image.PNG",preview=True))
+        preview = p.media_member("/data/a/b/image.PNG", position=1, total_media=1, preview=True)
+        self.assertEqual(preview, p.relative + "/previews/13_p01.jpg")
+        self.assertNotEqual(original, preview)
         with self.assertRaises(layout.LayoutError):
-            p.media_member("/data/../passwd")
+            p.media_member("/data/../passwd", position=1, total_media=1)
         with self.assertRaises(layout.LayoutError):
-            p.media_member("/data/with?token")
+            p.media_member("/data/with?token", position=1, total_media=1)
         with self.assertRaises(layout.LayoutError):
-            p.media_member("/data/evil%5cname.jpg")
+            p.media_member("/data/evil%5cname.jpg", position=1, total_media=1)
 
     def test_malformed_registry_and_duplicate_entry_fail(self):
         p=self.registry.plan("fanbox","123","456","Test")
@@ -133,12 +161,7 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaises(layout.LayoutError):
             layout.FrozenLayout.from_dict(legacy)
         legacy = self.registry.to_dict()
-        legacy["layout"] = "service/author_id/[post_id]title"
-        with self.assertRaises(layout.LayoutError):
-            layout.FrozenLayout.from_dict(legacy)
-        legacy = self.registry.to_dict()
-        legacy["posts"] = [{"service": "fanbox", "author_id": "123",
-                           "post_id": "456", "folder": "[456]Original"}]
+        legacy["layout"] = "posts/service/author_id/post_id"
         with self.assertRaises(layout.LayoutError):
             layout.FrozenLayout.from_dict(legacy)
         legacy = self.registry.to_dict()
@@ -159,7 +182,8 @@ class LayoutTests(unittest.TestCase):
 
     def test_synthetic_tar_roundtrip(self):
         p = self.registry.plan("fanbox","222","12","A title")
-        names=[p.member("post.json"),p.member("content.html"),p.member("status.json"),p.media_member("/data/f/file.jpg")]
+        names=[p.member("post.json"),p.member("content.html"),p.member("status.json"),
+               p.media_member("/data/f/file.jpg", position=1, total_media=1)]
         with tempfile.TemporaryFile() as f:
             with tarfile.open(fileobj=f,mode="w:gz") as tar:
                 for name in names:

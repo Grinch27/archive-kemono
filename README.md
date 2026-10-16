@@ -3,40 +3,53 @@
 Both **Favourite Posts** and **Favourite Artists** use one archive layout:
 
 ```text
-{service}/{author_id}/{post_id}_p{zero_padded_sequence}/
+{service}/{author_id}/[{post_id}]{sanitized_frozen_title}/
   post.json
   snapshot.json       # When a favourite-post snapshot is available
   listing.json        # Optional
   detail.json         # When the post-detail API succeeds
   content.html        # When content is a string
   status.json
-  media/              # Downloaded original files, local to this post
-  previews/           # Preview replacements, never counted as originals
+  media/              # {post_id}_p{order}.{original_extension}
+    987654_p01.jpg
+    987654_p02.mp4
+    987654_p03.png
+  previews/           # Replacement preview reuses the SAME page-order p index
+    987654_p02.jpg
 ```
 
 An artist archive may also contain `{service}/{author_id}/_author.json`,
 `_posts.json`, `_files.json`, and `_failed-files.json`. All tar member
 paths use POSIX separators. The identity is `(service, author_id, post_id)`;
-the p-number is the first registered post's sequence (width = digits(total) + 1). Titles remain only in JSON.
+titles are for readability, not identification.
 
 ## Format contract
 
 - **Only V2 is supported for new production archives.** No V1 archive import,
   V1 recovery, V1-to-V2 converter, or V1 media layout fallback exists.
-- The `layout-registry.json` release asset contains `schema_version: 2`,
-  the layout identifier, and frozen post folder names. For 1,289 posts use
-  five digits: `12345_p00001` to `67890_p01289` (example post IDs).
-  For 25 posts use three digits: `12345_p001`. The initial sequence and
-  padding are frozen across subsequent runs and both favourite modes. Adding
-  posts does not rename previously archived folders. The post title remains
-  intact in the JSON/HTML content, not the folder name.
-  Only published registries with the **new** layout identifier are reusable.
-  Previous title-based V2 registries are incompatible and are not imported.
+- The `layout-registry.json` release asset contains `schema_version: 2`
+  and frozen post folder names. Reuse a previously **published** V2 registry
+  so that the same post retains its directory even if its title changes.
 - A Favourite Posts staging batch manifest must contain `schema_version: 2`.
   Assembly rejects missing/older versions and rejects tar entries that are
   not inside the approved V2 post directories. The final
   `archive-manifest.json` also has `schema_version: 2`.
-- `status.json` records a post's original and preview file associations.
+- `status.json` records each media item, its `page_position`,
+  `page_media_total`, original reference, file association and failures.
+  Numbering is **per post, not across the collection**. Images, videos and
+  other media share one sequence based on the page's available ordering:
+  primary file, visible HTML media in DOM order, then detached attachments
+  in their API order. Distinct types are never independently renumbered.
+  For 3 media items, use `p01` to `p03`; for 25, `p001` to `p025`.
+  The width is the decimal digits in that post's total media item count,
+  **plus one leading-zero position**. Repeated references reuse the
+  same number, and missing originals retain their slots, with failure
+  recorded in `status.json`. The original filenames/paths live in JSON,
+  not in on-disk names. A preview uses the same p number and its *actual*
+  image extension, even when the original was a video.
+  Detached API attachment arrays cannot always recover the precise
+  rendered page placement; their original order is preserved without
+  asserting unsupported DOM positions. External embeds remain references.
   Files from different posts have separate archive paths, even if they
   originated from the same URL. A preview is never counted as an original.
 - The existing streamed, size-checked Release upload, 1,800 MB default part

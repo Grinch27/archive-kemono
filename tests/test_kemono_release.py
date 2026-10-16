@@ -49,6 +49,28 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             app.file_references(detail)
 
+    def test_mixed_page_media_order_is_shared_with_favourites(self):
+        detail = {
+            "post": {
+                "file": {"path": "/a/cover.jpg"},
+                "content": '<img src="/a/one.png"><video><source src="/a/clip.mp4"></video>',
+                "attachments": [{"path": "/a/last.jpg"}],
+            },
+            "attachments": [{"path": "/a/last.jpg", "server": "https://n1.kemono.cr"},
+                            {"path": "/a/one.png", "server": "https://n1.kemono.cr"},
+                            {"path": "/a/cover.jpg", "server": "https://n1.kemono.cr"}],
+            "videos": [{"path": "/a/clip.mp4", "server": "https://n1.kemono.cr"}],
+        }
+        refs = app.file_references(detail)
+        self.assertEqual([r["path"] for r in refs],
+                         ["/a/cover.jpg", "/a/one.png", "/a/clip.mp4", "/a/last.jpg"])
+        self.assertEqual([r["page_position"] for r in refs], [1, 2, 3, 4])
+        self.assertEqual({r["page_media_total"] for r in refs}, {4})
+        p = app.layout.FrozenLayout().plan("fanbox", "12", "345", "Title")
+        self.assertEqual(p.media_member(refs[2]["path"], position=refs[2]["page_position"],
+                                        total_media=refs[2]["page_media_total"]),
+                         "fanbox/12/[345]Title/media/345_p03.mp4")
+
     def test_pagination_and_limit(self):
         calls = []
         class Api:
@@ -379,26 +401,26 @@ elif args[0] == "api":
             self.assertEqual(manifest["media_complete"], not fail)
             parts = b"".join(assets[p["name"]] for p in manifest["assets"])
             with tarfile.open(fileobj=io.BytesIO(parts), mode="r:*") as archive:
-                self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","2",None, position=2, total_posts=2).media_member("/a/later.bin")).read(), b"original")
-                self.assertEqual(json.load(archive.extractfile("fanbox/56018056/2_p02/detail.json"))["post"]["content"], "fixture body")
+                self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","2",None).media_member("/a/later.bin", position=2, total_media=2)).read(), b"original")
+                self.assertEqual(json.load(archive.extractfile("fanbox/56018056/[2]/detail.json"))["post"]["content"], "fixture body")
                 if fail:
                     failures = json.loads((Path(temp)/"failed-files.json").read_text())
                     self.assertEqual(json.load(archive.extractfile("fanbox/56018056/_failed-files.json")), failures)
                     item = failures["files"][0]
                     self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 0 if missing_node else 1, 3, 0 if missing_node else 28))
-                    self.assertFalse(any(name.startswith("fanbox/56018056/1_p01/media/") for name in archive.getnames()))
+                    self.assertFalse(any(name.startswith("fanbox/56018056/[1]/media/") for name in archive.getnames()))
                     self.assertEqual(manifest["preview_file_count"], 2 * int(fallback is True))
                     self.assertEqual(manifest["preview_bytes"], 16 if fallback is True else 0)
                     if fallback is True:
                         self.assertEqual(archive.extractfile(item["preview_archive_path"]).read(), b"original")
-                        self.assertTrue(item["preview_archive_path"].startswith("fanbox/56018056/1_p01/previews/"))
+                        self.assertTrue(item["preview_archive_path"].startswith("fanbox/56018056/[1]/previews/"))
                         records = json.load(archive.extractfile("fanbox/56018056/_files.json"))
                         self.assertEqual(records[0]["kind"], "preview")
                     elif fallback is False:
                         self.assertEqual(item["preview_failure"]["exit_code"], 28)
                     self.assertIn("INCOMPLETE", notes)
                 else:
-                    self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","1",None, position=1, total_posts=2).media_member("/a/file.bin")).read(), b"original")
+                    self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","1",None).media_member("/a/file.bin", position=1, total_media=1)).read(), b"original")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# 待确认：Favourite Posts与Artists任务排序是否影响首次分配的序号、永久注册表的私有存储位置。
-# 歧义：按首次任务总数确定p字段宽度；后续集合增长不重命名；不同空白注册表无法协调序号。
+# 待确认：真实 Favourite Artists 全量帖子的标题分布、永久路径注册表的私有存储位置。
+# 歧义：首次归档时若各来源的标题不一致，以首次成功登记的标题作为冻结值；不承诺不同空白注册表独立规划结果一致。
 # 后续研究：V2 冻结注册表完整性核验、Windows 解压路径长度与长期备份策略。
 # 潜在优化：注册表较大时按作者分片；当前先保留标准库、可复核、确定性逻辑。
-# 风险：编号与任务顺序可能透露账户收藏信息；注册表不得未经授权提交到公开 Git 历史。
-# 验证重点：真实快照、按任务总数补零、DOS保留名、大小写冲突、跨来源同一帖子复用及序号冻结。
+# 风险：目录名可能包含敏感标题；注册表是私有资产；不得未经授权提交到公开 Git 历史。
+# 验证重点：真实快照、Unicode、DOS 保留名、大小写冲突、路径长度、冻结后标题变化、跨来源同一帖子复用。
 """Shared, offline V2 path planner for favourite posts and favourite artists.
 
 This module DOES NOT download content, change a repository or write a registry by
@@ -20,11 +20,11 @@ import re
 import unicodedata
 import zipfile
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Dict, Mapping, Optional, Tuple
 
 VERSION = 2
-LAYOUT_NAME = "service/author_id/post_id_p{padded_sequence}"
 MAX_TITLE_BYTES = 112
 MAX_POST_COMPONENT_BYTES = 180
 MAX_POST_RELATIVE_BYTES = 205
@@ -95,23 +95,19 @@ def _portable_key(path: str) -> str:
     return unicodedata.normalize("NFD", path).casefold()
 
 
-def serial_width(post_count: int) -> int:
-    """One extra leading-zero position beyond the decimal width of total posts."""
-    if isinstance(post_count, bool) or not isinstance(post_count, int) or post_count < 1:
-        raise LayoutError("post total must be a positive integer")
-    return len(str(post_count)) + 1
+def _sha_suffix(parts: Tuple[str, str, str]) -> str:
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()[:12]
 
 
-def _segment(service: str, author_id: str, post_id: str,
-             position: int, post_count: int) -> str:
-    if isinstance(position, bool) or not isinstance(position, int) or position < 1:
-        raise LayoutError("post sequence must be a positive integer")
-    width = max(serial_width(post_count), len(str(position)) + 1)
-    value = f"{post_id}_p{position:0{width}d}"
-    budget = min(MAX_POST_COMPONENT_BYTES, MAX_POST_RELATIVE_BYTES - len(f"{service}/{author_id}/".encode()))
-    if len(value.encode("utf-8")) > budget:
-        raise LayoutError("post ID and sequence exceed path budget")
-    return value
+def _segment(service: str, author_id: str, post_id: str, title: Optional[str], suffix: str = "") -> str:
+    prefix = f"[{post_id}]"
+    capacity = min(MAX_POST_COMPONENT_BYTES, MAX_POST_RELATIVE_BYTES - len(f"{service}/{author_id}/".encode()))
+    if len(prefix.encode()) + len(suffix.encode()) > capacity:
+        raise LayoutError("relative path budget too small for complete post id")
+    cleaned = _clean_text(title)
+    budget = min(MAX_TITLE_BYTES, capacity - len(prefix.encode()) - len(suffix.encode()))
+    cleaned = _utf8_truncate(cleaned, budget).rstrip(" ._")
+    return prefix + cleaned + suffix
 
 
 def _check_segment(segment: str) -> None:
@@ -144,8 +140,9 @@ class PostPath:
             raise LayoutError("post member exceeds portable path budget")
         return path
 
-    def media_member(self, identity_path: str, *, preview: bool = False) -> str:
-        """Deterministic post-local media path; identity_path must be a trusted path, not a URL."""
+    def media_member(self, identity_path: str, *, position: int, total_media: int,
+                     preview: bool = False, preview_suffix: str = ".jpg") -> str:
+        """Use page-order numbering shared across images and videos in the post."""
         if not isinstance(identity_path, str) or not identity_path.startswith("/"):
             raise LayoutError("media identity must be an absolute URL path")
         if "\\" in identity_path or "?" in identity_path or "#" in identity_path or "\x00" in identity_path:
@@ -159,21 +156,136 @@ class PostPath:
         stem_name = PurePosixPath(decoded).name
         if not stem_name or stem_name in (".", ".."):
             raise LayoutError("missing media basename")
-        ext = PurePosixPath(stem_name).suffix
-        if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext):
-            ext = ""
-        short_stem = stem_name[:-len(ext)] if ext else stem_name
-        short_stem = _clean_text(short_stem) or "file"
+        if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+            raise LayoutError("invalid media position")
+        if isinstance(total_media, bool) or not isinstance(total_media, int) or total_media < position:
+            raise LayoutError("invalid media total")
+        ext = PurePosixPath(stem_name).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+            ext = ".bin"
+        if preview:
+            if not re.fullmatch(r"\.(?:jpg|jpeg|png|gif|webp|avif|bmp|tiff?)", preview_suffix):
+                raise LayoutError("invalid preview image suffix")
+            ext = preview_suffix
+        width = len(str(total_media)) + 1
+        name = f"{self.post_id}_p{position:0{width}d}{ext}"
         subfolder = "previews" if preview else "media"
-        sig = hashlib.sha256(decoded.encode("utf-8")).hexdigest()[:16]
-        suffix = f"__{sig}{ext.lower()}"
-        available = MAX_MEMBER_RELATIVE_BYTES - len(f"{self.relative}/{subfolder}/".encode()) - len(suffix.encode())
-        if available < 1:
-            raise LayoutError("no portable path space for media name")
-        file_name = _utf8_truncate(short_stem, min(68, available)).rstrip(" ._") + suffix
-        if len(file_name.encode()) > 180:
-            raise LayoutError("media filename exceeds portable component budget")
-        return f"{self.relative}/{subfolder}/{file_name}"
+        member = f"{self.relative}/{subfolder}/{name}"
+        if len(name.encode()) > 180 or len(member.encode()) > MAX_MEMBER_RELATIVE_BYTES:
+            raise LayoutError("media member exceeds portable path budget")
+        return member
+
+
+class _PageMedia(HTMLParser):
+    """Return one candidate per rendered image/video slot, in DOM sequence."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.refs = []
+        self.picture_depth = 0
+        self.video_depth = 0
+        self.video_source_seen = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "picture":
+            self.picture_depth += 1
+            return
+        if tag == "video":
+            self.video_depth += 1
+            self.video_source_seen = False
+        if tag not in ("img", "video", "audio", "source"):
+            return
+        if tag == "source" and (self.picture_depth or self.video_depth and self.video_source_seen):
+            return
+        raw = attrs.get("src") or attrs.get("data-src")
+        if not raw:
+            srcset = attrs.get("srcset") or attrs.get("data-srcset") or ""
+            if srcset and not srcset.startswith("data:"):
+                raw = srcset.split(",", 1)[0].strip().split(" ", 1)[0]
+        # A video poster describes the same video slot, not another media item.
+        if raw:
+            self.refs.append({"raw": raw, "field": "html"})
+            if tag == "video" or tag == "source" and self.video_depth:
+                self.video_source_seen = True
+
+    def handle_endtag(self, tag):
+        if tag == "picture" and self.picture_depth:
+            self.picture_depth -= 1
+        if tag == "video" and self.video_depth:
+            self.video_depth -= 1
+            self.video_source_seen = False
+
+
+def page_media_entries(post, detail=None):
+    """Primary media, then inline HTML in DOM order, then attachment API order.
+
+    Media repeated in snapshot/detail is deduplicated by the caller on canonical
+    identity. Unsupported external URLs are retained as references, not fetched.
+    The API has no unified DOM ordering for detached attachment arrays.
+    """
+    if not isinstance(post, dict):
+        return []
+    out = []
+    for field in ("file", "shared_file"):
+        item = post.get(field)
+        if isinstance(item, dict) and item.get("path"):
+            out.append({"raw": item["path"], "field": field, "name": item.get("name")})
+    parser = _PageMedia()
+    content = post.get("content")
+    if isinstance(content, str):
+        parser.feed(content)
+    out.extend(parser.refs)
+    for item in post.get("attachments") or []:
+        if isinstance(item, dict) and item.get("path"):
+            out.append({"raw": item["path"], "field": "attachment", "name": item.get("name")})
+    if isinstance(detail, dict):
+        for field in ("attachments", "videos"):
+            for item in detail.get(field) or []:
+                if isinstance(item, dict) and item.get("path"):
+                    out.append({"raw": item["path"], "field": field, "name": item.get("name")})
+    return out
+
+
+def preview_image_suffix(header):
+    """Infer preview image format from bytes, not the video's original suffix."""
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return ".webp"
+    if header[4:8] == b"ftyp" and header[8:12] in (b"avif", b"avis"):
+        return ".avif"
+    if header[:2] == b"BM":
+        return ".bmp"
+    if header[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tiff"
+    raise LayoutError("unknown preview image format")
+
+
+def media_positions(records):
+    """Assign one stable page position per distinct media reference, without grouping by type.
+
+    Each duplicate in metadata receives the same position. Failed references
+    still occupy a slot, so later files never shift to close gaps.
+    """
+    if not isinstance(records, list):
+        raise LayoutError("media references must be a list")
+    indexes = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise LayoutError("media reference must be an object")
+        identity = record.get("path") or record.get("raw")
+        if not isinstance(identity, str) or not identity:
+            raise LayoutError("media identity missing")
+        if identity not in indexes:
+            indexes[identity] = len(indexes) + 1
+        record["page_position"] = indexes[identity]
+    for record in records:
+        record["page_media_total"] = len(indexes)
+    return records
 
 
 class FrozenLayout:
@@ -200,25 +312,14 @@ class FrozenLayout:
             raise LayoutError("artist record must be an object")
         return self.author(record.get("service"), record.get("id"))
 
-    def plan(self, service: str, author_id: str, post_id: str,
-             title: Optional[str] = None, *, position: Optional[int] = None,
-             total_posts: Optional[int] = None) -> PostPath:
+    def plan(self, service: str, author_id: str, post_id: str, title: Optional[str]) -> PostPath:
         identity = _identity(service, author_id, post_id)
         self.author(service, author_id)
         existing = self._posts.get(identity)
         if existing is not None:
-            return existing  # First assigned post sequence is frozen across both modes.
-        # The title stays in JSON and does not influence directory names.
-        if position is None:
-            position = len(self._posts) + 1
-        if total_posts is None:
-            total_posts = max(position, len(self._posts) + 1)
-        serial_width(total_posts)
-        if isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= total_posts:
-            raise LayoutError("sequence must belong to its initial post total")
-        # Case-insensitive post-ID collisions may require skipping a sequence.
-        for candidate in range(position, position + len(self._posts) + 2):
-            folder = _segment(service, author_id, post_id, candidate, total_posts)
+            return existing  # Freeze beats a changed API title.
+        for suffix in ("", "__" + _sha_suffix(identity)):
+            folder = _segment(service, author_id, post_id, title, suffix)
             _check_segment(folder)
             target = PostPath(service, author_id, post_id, folder)
             key = _portable_key(target.relative)
@@ -228,15 +329,12 @@ class FrozenLayout:
                 return target
         raise LayoutError("portable post path collision cannot be resolved")
 
-    def favourite_post(self, item: Mapping[str, object], *, position: Optional[int] = None,
-                       total_posts: Optional[int] = None) -> PostPath:
+    def favourite_post(self, item: Mapping[str, object]) -> PostPath:
         if not isinstance(item, Mapping):
             raise LayoutError("post record must be an object")
-        return self.plan(item.get("service"), item.get("user"), item.get("id"),
-                         item.get("title"), position=position, total_posts=total_posts)
+        return self.plan(item.get("service"), item.get("user"), item.get("id"), item.get("title"))
 
-    def artist_post(self, artist: Mapping[str, object], item: Mapping[str, object],
-                    *, position: Optional[int] = None, total_posts: Optional[int] = None) -> PostPath:
+    def artist_post(self, artist: Mapping[str, object], item: Mapping[str, object]) -> PostPath:
         if not isinstance(artist, Mapping) or not isinstance(item, Mapping):
             raise LayoutError("artist/post must be objects")
         service, author_id, _ = _identity(artist.get("service"), artist.get("id"), "dummy")
@@ -244,10 +342,10 @@ class FrozenLayout:
         if (service, author_id) != (post_service, post_author):
             raise LayoutError("post identity differs from selected favourite artist")
         self.artist(artist)
-        return self.favourite_post(item, position=position, total_posts=total_posts)
+        return self.favourite_post(item)
 
     def to_dict(self) -> dict:
-        return {"schema_version": VERSION, "layout": LAYOUT_NAME,
+        return {"schema_version": VERSION, "layout": "service/author_id/[post_id]title",
                 "posts": [{"service": x.service, "author_id": x.author_id,
                            "post_id": x.post_id, "folder": x.folder}
                           for x in sorted(self._posts.values(), key=lambda x:(x.service,x.author_id,x.post_id))],
@@ -256,7 +354,7 @@ class FrozenLayout:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "FrozenLayout":
         if (not isinstance(data, dict) or data.get("schema_version") != VERSION
-                or data.get("layout") != LAYOUT_NAME
+                or data.get("layout") != "service/author_id/[post_id]title"
                 or not isinstance(data.get("posts"), list) or not isinstance(data.get("authors"), list)):
             raise LayoutError("invalid V2 registry")
         registry = cls()
@@ -270,9 +368,7 @@ class FrozenLayout:
                 raise LayoutError("invalid registered post")
             service, user, post_id = _identity(row.get("service"), row.get("author_id"), row.get("post_id"))
             folder = row.get("folder")
-            if (not isinstance(folder, str) or not re.fullmatch(re.escape(post_id) + r"_p0[0-9]+", folder)
-                    or int(folder.rsplit("_p", 1)[1]) < 1
-                    or len(folder.encode()) > MAX_POST_COMPONENT_BYTES):
+            if not isinstance(folder, str) or not folder.startswith(f"[{post_id}]") or len(folder.encode()) > MAX_POST_COMPONENT_BYTES:
                 raise LayoutError("invalid frozen post folder")
             _check_segment(folder)
             obj = PostPath(service, user, post_id, folder)
@@ -307,8 +403,8 @@ def inspect_zip(path: Path) -> dict:
     registry = FrozenLayout()
     for artist in artists:
         registry.artist(artist)
-    for position, post in enumerate(posts, 1):
-        registry.favourite_post(post, position=position, total_posts=len(posts))
+    for post in posts:
+        registry.favourite_post(post)
     overlap = {(x.get("service"), x.get("id")) for x in artists}
     overlap_posts = sum((p["service"], p["user"]) in overlap for p in posts)
     actual = [registry.favourite_post(p) for p in posts]
@@ -317,12 +413,18 @@ def inspect_zip(path: Path) -> dict:
     summary = {"artist_count": len(artists), "post_count": len(posts),
                "unique_paths": len({_portable_key(x.relative) for x in actual}),
                "overlap_post_count": overlap_posts,
-               "post_sequence_width": serial_width(len(posts)) if posts else 0,
-               "post_sequence_first": actual[0].folder if actual else None,
-               "post_sequence_last": actual[-1].folder if actual else None,
+               "title_cleaning_count": sum(_clean_text(p.get("title")) != (p.get("title") or "") for p in posts),
+               "title_truncation_count": sum(
+                   len(_clean_text(p.get("title")).encode("utf-8")) >
+                   len(x.folder.removeprefix(f"[{x.post_id}]").encode("utf-8"))
+                   for p, x in zip(posts, actual)
+               ),
+               "fallback_no_title": sum(x.folder == f"[{x.post_id}]" for x in actual),
                "max_post_folder_bytes": max((len(x.folder.encode()) for x in actual), default=0),
                "max_post_relative_bytes": max((len(x.relative.encode()) for x in actual), default=0),
-               "media_path_smoke_test": all(len(x.media_member("/data/example/image.jpeg").encode()) <= MAX_MEMBER_RELATIVE_BYTES for x in actual)}
+               "media_path_smoke_test": all(
+                   len(x.media_member("/data/example/image.jpeg", position=1, total_media=1).encode()) <= MAX_MEMBER_RELATIVE_BYTES
+                   for x in actual)}
     return summary
 
 
