@@ -157,6 +157,11 @@ class FavoritesTests(unittest.TestCase):
         def read_json(release_id, name):
             if name == "targets.json":
                 return targets
+            if name == "layout-registry.json":
+                registry = app.layout.FrozenLayout()
+                for target in targets:
+                    registry.favourite_post(target)
+                return registry.to_dict()
             return json.loads(next(payloads[a["id"]] for a in store[release_id] if a["name"] == name))
         class Api:
             def get(self, path):
@@ -199,10 +204,10 @@ class FavoritesTests(unittest.TestCase):
             self.assertTrue(all(0 < p["size"] <= 200 for p in manifest["assets"]))
             compressed = b"".join(payloads[p["id"]] for p in manifest["assets"])
             with tarfile.open(fileobj=io.BytesIO(compressed), mode="r:xz") as archive:
-                self.assertEqual(sum(n.startswith("media/") for n in archive.getnames()), 1)
+                self.assertEqual(sum("/media/" in n for n in archive.getnames()), 3)
                 self.assertEqual(sum(n.endswith("/snapshot.json") for n in archive.getnames()), 3)
-                self.assertEqual(archive.extractfile("posts/fanbox/fixture/0/content.html").read().decode(), "合成正文")
-                self.assertNotIn(b"faved_seq", archive.extractfile("posts/fanbox/fixture/0/snapshot.json").read())
+                self.assertEqual(archive.extractfile("fanbox/fixture/[0]合成标题/content.html").read().decode(), "合成正文")
+                self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/[0]合成标题/snapshot.json").read())
             self.assertEqual(len(publications), 1)
             self.assertIn("draft=false", publications[0])
 

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 SPEC = importlib.util.spec_from_file_location("kemono_release", Path(__file__).resolve().parents[1] / "scripts/kemono_release.py")
 app = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(app)
@@ -306,7 +307,7 @@ elif args[0] == "api":
                 self.assertEqual(len(edits), 1)
                 self.assertIn("--prerelease=true", edits[0])
                 self.assertIn("--draft=false", edits[0])
-                self.assertEqual(len(json.loads((root/"state.json").read_text())), 4)
+                self.assertEqual(len(json.loads((root/"state.json").read_text())), 5)
             else:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(edits, [])
@@ -368,26 +369,26 @@ elif args[0] == "api":
             self.assertEqual(manifest["media_complete"], not fail)
             parts = b"".join(assets[p["name"]] for p in manifest["assets"])
             with tarfile.open(fileobj=io.BytesIO(parts), mode="r:*") as archive:
-                self.assertEqual(archive.extractfile("media/a/later.bin").read(), b"original")
-                self.assertEqual(json.load(archive.extractfile("posts/2.json"))["post"]["content"], "fixture body")
+                self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","2",None).media_member("/a/later.bin")).read(), b"original")
+                self.assertEqual(json.load(archive.extractfile("fanbox/56018056/[2]/detail.json"))["post"]["content"], "fixture body")
                 if fail:
                     failures = json.loads((Path(temp)/"failed-files.json").read_text())
-                    self.assertEqual(json.load(archive.extractfile("metadata/failed-files.json")), failures)
+                    self.assertEqual(json.load(archive.extractfile("fanbox/56018056/_failed-files.json")), failures)
                     item = failures["files"][0]
                     self.assertEqual((item["post_id"], item["attempts"], item["timeout_seconds"], item["exit_code"]), ("1", 0 if missing_node else 1, 3, 0 if missing_node else 28))
-                    self.assertNotIn("media/a/file.bin", archive.getnames())
+                    self.assertFalse(any(name.startswith("fanbox/56018056/[1]/media/") for name in archive.getnames()))
                     self.assertEqual(manifest["preview_file_count"], int(fallback is True))
                     self.assertEqual(manifest["preview_bytes"], 8 if fallback is True else 0)
                     if fallback is True:
-                        self.assertEqual(archive.extractfile("previews/a/file.bin").read(), b"original")
-                        self.assertEqual(item["preview_archive_path"], "previews/a/file.bin")
-                        records = json.load(archive.extractfile("metadata/files.json"))
+                        self.assertEqual(archive.extractfile(item["preview_archive_path"]).read(), b"original")
+                        self.assertTrue(item["preview_archive_path"].startswith("fanbox/56018056/[1]/previews/"))
+                        records = json.load(archive.extractfile("fanbox/56018056/_files.json"))
                         self.assertEqual(records[0]["kind"], "preview")
                     elif fallback is False:
                         self.assertEqual(item["preview_failure"]["exit_code"], 28)
                     self.assertIn("INCOMPLETE", notes)
                 else:
-                    self.assertEqual(archive.extractfile("media/a/file.bin").read(), b"original")
+                    self.assertEqual(archive.extractfile(app.layout.FrozenLayout().plan("fanbox","56018056","1",None).media_member("/a/file.bin")).read(), b"original")
 
 
 if __name__ == "__main__":

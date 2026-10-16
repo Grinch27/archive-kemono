@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path, PurePosixPath
+import archive_layout as layout
 
 BASE = "https://kemono.cr"
 PART_MAX = 1_900_000_000  # Also below decimal 2GB, not just GitHub's 2GiB.
@@ -351,6 +352,13 @@ def main():
     if not limit and profile.get("post_count") != len(posts):
         raise RuntimeError("分页数量与profile不符，可能更新中；停止而不声明完整")
     print(f"准备归档{len(posts)}条帖子。", flush=True)
+    registry_file = os.environ.get("LAYOUT_REGISTRY_FILE")
+    registry = (layout.FrozenLayout.from_dict(json.loads(Path(registry_file).read_text()))
+                if registry_file else layout.FrozenLayout())
+    registry.author(service, user)
+    planned_posts = [registry.plan(service, user, entry["id"], entry.get("title"))
+                     for entry in posts]
+    author_prefix = registry.author(service, user)
     temp = Path(os.environ["RUNNER_TEMP"]) / "kemono-archive"
     temp.mkdir(exist_ok=False)
     extension = "xz" if compression == "xz" else "gz"
@@ -363,18 +371,29 @@ def main():
                       else gzip.GzipFile(fileobj=writer, mode="wb", compresslevel=1, mtime=0))
         with compressor as compressed:
             with tarfile.open(fileobj=compressed, mode="w|") as archive:
-                add_json(archive, "metadata/profile.json", profile)
-                add_json(archive, "metadata/posts.json", posts)
+                add_json(archive, author_prefix + "/_author.json", profile)
+                add_json(archive, author_prefix + "/_posts.json", posts)
                 for index, entry in enumerate(posts, 1):
+                    planned = planned_posts[index - 1]
+                    post_seen = set()
+                    files_before, failures_before = len(files), len(failures)
                     print(f"读取帖子详情{index}/{len(posts)}。", flush=True)
                     detail = api.get(f"/{service}/user/{user}/post/{entry['id']}")
                     post = detail.get("post") if isinstance(detail, dict) else None
                     if not isinstance(post, dict) or (post.get("service"), post.get("user"), post.get("id")) != (service, user, entry["id"]):
                         raise RuntimeError("详情帖子标识不符")
-                    add_json(archive, f"posts/{entry['id']}.json", detail)
+                    add_json(archive, planned.member("post.json"), entry)
+                    add_json(archive, planned.member("detail.json"), detail)
+                    content = post.get("content")
+                    if isinstance(content, str):
+                        payload = content.encode("utf-8")
+                        info = tarfile.TarInfo(planned.member("content.html"))
+                        info.size, info.mode, info.mtime = len(payload), 0o644, 0
+                        archive.addfile(info, io.BytesIO(payload))
                     for item in file_references(detail):
-                        if item["path"] in seen:
+                        if item["path"] in post_seen:
                             continue
+                        post_seen.add(item["path"])
                         seen.add(item["path"])
                         kind, download_url = "original", item["url"]
                         print(f"准备原文件{len(seen)}，节点{urllib.parse.urlsplit(download_url or '').hostname}。", flush=True)
@@ -398,7 +417,7 @@ def main():
                                 save_failures(failure_path, source, failures)
                                 continue
                         try:
-                            name = ("media/" if kind == "original" else "previews/") + item["path"].lstrip("/")
+                            name = planned.media_member(item["path"], preview=(kind == "preview"))
                             info = tarfile.TarInfo(name)
                             info.size, info.mode, info.mtime = media.size, 0o644, 0
                             archive.addfile(info, media)
@@ -411,14 +430,21 @@ def main():
                                 save_failures(failure_path, source, failures)
                         finally:
                             media.close()
+                    add_json(archive, planned.member("status.json"), {
+                        "identity": [service, user, entry["id"]],
+                        "files": files[files_before:],
+                        "failures": failures[failures_before:],
+                        "original_media_complete": len(failures) == failures_before
+                    })
                     print(f"帖子{index}/{len(posts)}；已归档{len(files)}个文件（含预览），缺原文件{len(failures)}个。", flush=True)
-                add_json(archive, "metadata/files.json", files)
+                add_json(archive, author_prefix + "/_files.json", files)
                 if failures:
-                    add_json(archive, "metadata/failed-files.json", {"source": source, "files": failures})
+                    add_json(archive, author_prefix + "/_failed-files.json", {"source": source, "files": failures})
         writer.finish()
         originals = [f for f in files if f["kind"] == "original"]
         previews = [f for f in files if f["kind"] == "preview"]
-        manifest = {"source": source, "post_count": len(posts), "file_count": len(files),
+        manifest = {"schema_version": 2, "layout": "service/author_id/[post_id]title",
+                    "source": source, "post_count": len(posts), "file_count": len(files),
                     "original_file_count": len(originals), "preview_file_count": len(previews),
                     "original_bytes": sum(f["bytes"] for f in originals),
                     "preview_bytes": sum(f["bytes"] for f in previews), "limited_run": bool(limit),
@@ -437,6 +463,8 @@ def main():
                  + f"Windows: `copy /b {stem}.part* {stem}`, then extract with 7-Zip.\n\n"
                  + "External embeds are retained as references. No credentials or cookies are included.")
         (temp / "release-notes.md").write_text(notes + "\n", encoding="utf-8")
+        (temp / "layout-registry.json").write_text(
+            json.dumps(registry.to_dict(), ensure_ascii=False) + "\n", encoding="utf-8")
         title = f"{service}/{user} · {len(posts)} posts" + (" · sample" if limit else "")
         title += " · INCOMPLETE" if failures else ""
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:

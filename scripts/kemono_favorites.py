@@ -24,6 +24,7 @@ import time
 import urllib.parse
 
 import kemono_release as base
+import archive_layout as layout
 
 PART_BYTES = 1_800_000_000
 BATCH_SIZE = 25
@@ -160,6 +161,21 @@ def emit(**values):
             output.write(f"{name}={value}\n")
 
 
+def load_latest_layout():
+    """Load newest verified V2 release's frozen path map; initial V2 uses empty registry."""
+    previous = gh("api", f"repos/{repo()}/releases?per_page=100")
+    if not isinstance(previous, list):
+        raise RuntimeError("invalid releases listing")
+    for release in previous:
+        if release.get("draft") or not release.get("tag_name", "").startswith(
+                ("kemono-favorites-archive-", "kemono-patreon-", "kemono-fanbox-")):
+            continue
+        present = [a for a in release.get("assets", []) if a.get("name") == "layout-registry.json"]
+        if present:
+            return layout.FrozenLayout.from_dict(download_json_asset(release["id"], "layout-registry.json"))
+    return layout.FrozenLayout()
+
+
 def inventory():
     if not os.environ.get("KEMONO_USERNAME") or not os.environ.get("KEMONO_PASSWORD"):
         raise RuntimeError("both existing Kemono account Secrets are required")
@@ -172,12 +188,18 @@ def inventory():
     again = validate_inventory(api.get("/account/favorites?type=post"), baseline)
     if {digest(key(p)): digest(p) for p in posts} != {digest(key(p)): digest(p) for p in again}:
         raise RuntimeError("favorites changed during inventory; retry with a stable target list")
+    registry = load_latest_layout()
+    for post in posts:
+        registry.favourite_post(post)
     stamp = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     tag = "kemono-favorites-staging-" + stamp
     release_id = create_draft(tag, "Private staging for favorites " + stamp)
     path = Path(os.environ["RUNNER_TEMP"]) / "targets.json"
     save_json(path, posts)
     upload(tag, release_id, path)
+    registry_path = Path(os.environ["RUNNER_TEMP"]) / "layout-registry.json"
+    save_json(registry_path, registry.to_dict())
+    upload(tag, release_id, registry_path)
     count = (len(posts) + BATCH_SIZE - 1) // BATCH_SIZE
     if count > 256:
         raise RuntimeError("target list exceeds the GitHub matrix limit; adjust batch size before running")
@@ -355,6 +377,7 @@ def write_part_archive(directory, stem, tag, release_id, produce, extreme=False)
 def batch(index, staging_id, staging_tag):
     posts = download_json_asset(staging_id, "targets.json")
     selected = posts[index * BATCH_SIZE:(index + 1) * BATCH_SIZE]
+    registry = layout.FrozenLayout.from_dict(download_json_asset(staging_id, "layout-registry.json"))
     if not selected:
         raise ValueError("empty batch")
     directory = Path(os.environ["RUNNER_TEMP"]) / f"favorites-batch-{index:05d}"
@@ -366,18 +389,20 @@ def batch(index, staging_id, staging_tag):
         saved = {}
         for position, snapshot in enumerate(selected, 1):
             service, user, post_id = key(snapshot)
-            prefix = f"posts/{service}/{user}/{post_id}"
+            planned = registry.favourite_post(snapshot)
+            prefix = planned.relative
+            base.add_json(archive, planned.member("post.json"), clean(snapshot))
             base.add_json(archive, prefix + "/snapshot.json", clean(snapshot))
             content = snapshot.get("content")
             if isinstance(content, str):
-                add_bytes(archive, prefix + "/content.html", content.encode("utf-8"))
+                add_bytes(archive, planned.member("content.html"), content.encode("utf-8"))
             detail, detail_error = {}, None
             try:
                 detail = api.get(f"/{service}/user/{user}/post/{post_id}")
                 if not isinstance(detail, dict) or not isinstance(detail.get("post"), dict) or key(detail["post"]) != key(snapshot):
                     raise ValueError("post detail identity mismatch")
                 detail = clean(detail)
-                base.add_json(archive, prefix + "/detail.json", detail)
+                base.add_json(archive, planned.member("detail.json"), detail)
             except (RuntimeError, ValueError):
                 detail = {}
                 detail_error = "detail_unavailable"
@@ -397,7 +422,7 @@ def batch(index, staging_id, staging_tag):
                         continue
                     try:
                         with download(url, directory, image_only=kind == "preview") as path:
-                            name = ("media/" if kind == "original" else "previews/") + hashlib.sha256(identity.encode()).hexdigest()
+                            name = planned.media_member(record["path"], preview=(kind == "preview"))
                             info = tarfile.TarInfo(name)
                             info.size, info.mode, info.mtime = path.stat().st_size, 0o644, 0
                             with path.open("rb") as source:
@@ -421,7 +446,6 @@ def batch(index, staging_id, staging_tag):
             counts["posts_processed"] += 1
             counts["metadata_saved"] += 1
             print(f"Batch {index}: post {position}/{len(selected)} processed", flush=True)
-        base.add_json(archive, f"batches/{index:05d}/summary.json", counts)
         return counts
     parts, _ = write_part_archive(directory, f"batch-{index:05d}.tar.gz", staging_tag, staging_id, produce)
     path = directory / f"batch-{index:05d}.json"
@@ -513,6 +537,7 @@ def verify_archive(parts, expected):
 
 def assemble(staging_id, staging_tag):
     posts = download_json_asset(staging_id, "targets.json")
+    registry = layout.FrozenLayout.from_dict(download_json_asset(staging_id, "layout-registry.json"))
     batch_count = (len(posts) + BATCH_SIZE - 1) // BATCH_SIZE
     manifests = [download_json_asset(staging_id, f"batch-{i:05d}.json") for i in range(batch_count)]
     remote = {a["id"]: a for a in assets(staging_id)}
@@ -531,7 +556,8 @@ def assemble(staging_id, staging_tag):
     release_id = create_draft(tag, "Favourite Posts · assembling")
     seen = {}
     totals = {name: sum(m["counts"][name] for m in manifests) for name in manifests[0]["counts"]}
-    summary = {"target_union_total": len(posts), **totals, "posts_pending": 0,
+    summary = {"schema_version": 2, "layout": "service/author_id/[post_id]title",
+               "target_union_total": len(posts), **totals, "posts_pending": 0,
                "complete": totals["missing_originals"] == 0 and totals["detail_failed"] == 0,
                "compression": "xz -9e; one tar stream; CRC64", "part_bytes_max": PART_BYTES,
                "preview_is_original": False}
@@ -553,15 +579,12 @@ def assemble(staging_id, staging_tag):
                 reader.close()
             print(f"Merged batch {manifest['index'] + 1}/{batch_count}", flush=True)
         for post in posts:
-            prefix = "posts/" + "/".join(key(post))
-            required = [prefix + "/snapshot.json", prefix + "/status.json"]
+            planned = registry.favourite_post(post)
+            required = [planned.member("post.json"), planned.member("snapshot.json"), planned.member("status.json")]
             if isinstance(post.get("content"), str):
-                required.append(prefix + "/content.html")
+                required.append(planned.member("content.html"))
             if any(name not in seen for name in required):
                 raise RuntimeError("final archive is missing a target post or original text")
-        data = encoded(summary)
-        add_bytes(archive, "archive-summary.json", data)
-        seen["archive-summary.json"] = (len(data), hashlib.sha256(data).hexdigest())
         return summary
     parts, _ = write_part_archive(directory, "favorites.tar.xz", tag, release_id, produce, extreme=True)
     print("Re-downloading final parts in cloud to verify every member and xz CRC64", flush=True)
@@ -569,6 +592,12 @@ def assemble(staging_id, staging_tag):
     path = directory / "archive-manifest.json"
     save_json(path, {**summary, "assets": parts, "verified": True, "member_count": len(seen)})
     upload(tag, release_id, path)
+    registry_path = directory / "layout-registry.json"
+    save_json(registry_path, registry.to_dict())
+    upload(tag, release_id, registry_path)
+    summary_path = directory / "archive-summary.json"
+    save_json(summary_path, summary)
+    upload(tag, release_id, summary_path)
     incomplete = not summary["complete"]
     notes = (f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
              f"Processed {len(posts)} favourite posts. Metadata saved: {totals['metadata_saved']}. "

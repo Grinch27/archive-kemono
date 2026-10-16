@@ -6,7 +6,7 @@ name: Favourite archive inspect
 on:
   push:
     branches: [main]
-    paths: [.github/workflows/kemono-favorites-inspect.yml]
+    paths: ['.github/workflows/kemono-favorites-inspect.yml', 'scripts/*.py', 'tests/*.py']
   workflow_dispatch:
     inputs:
       release_id:
@@ -45,6 +45,9 @@ jobs:
       - uses: actions/checkout@main
         with:
           persist-credentials: false
+      - name: Run offline regression tests
+        shell: bash
+        run: python3 -m unittest discover -s tests -q -b
       - name: Read completed batch counters
         shell: bash
         env:

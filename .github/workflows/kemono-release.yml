@@ -216,7 +216,7 @@ jobs:
           INCOMPLETE: ${{ steps.archive.outputs.incomplete }}
         run: |
           set -euo pipefail
-          assets=("$ARCHIVE_DIR/archive-manifest.json")
+          assets=("$ARCHIVE_DIR/archive-manifest.json" "$ARCHIVE_DIR/layout-registry.json")
           if [[ -f "$RUNNER_TEMP/failed-files.json" ]]; then
             assets+=("$RUNNER_TEMP/failed-files.json")
           fi
