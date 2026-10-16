@@ -356,8 +356,9 @@ def main():
     registry = (layout.FrozenLayout.from_dict(json.loads(Path(registry_file).read_text()))
                 if registry_file else layout.FrozenLayout())
     registry.author(service, user)
-    planned_posts = [registry.plan(service, user, entry["id"], entry.get("title"))
-                     for entry in posts]
+    planned_posts = [registry.plan(service, user, entry["id"], entry.get("title"),
+                                   position=index, total_posts=len(posts))
+                     for index, entry in enumerate(posts, 1)]
     author_prefix = registry.author(service, user)
     temp = Path(os.environ["RUNNER_TEMP"]) / "kemono-archive"
     temp.mkdir(exist_ok=False)
@@ -443,7 +444,7 @@ def main():
         writer.finish()
         originals = [f for f in files if f["kind"] == "original"]
         previews = [f for f in files if f["kind"] == "preview"]
-        manifest = {"schema_version": 2, "layout": "service/author_id/[post_id]title",
+        manifest = {"schema_version": 2, "layout": layout.LAYOUT_NAME,
                     "source": source, "post_count": len(posts), "file_count": len(files),
                     "original_file_count": len(originals), "preview_file_count": len(previews),
                     "original_bytes": sum(f["bytes"] for f in originals),

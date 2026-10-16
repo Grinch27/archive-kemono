@@ -190,8 +190,8 @@ def inventory():
     if {digest(key(p)): digest(p) for p in posts} != {digest(key(p)): digest(p) for p in again}:
         raise RuntimeError("favorites changed during inventory; retry with a stable target list")
     registry = load_latest_layout()
-    for post in posts:
-        registry.favourite_post(post)
+    for position, post in enumerate(posts, 1):
+        registry.favourite_post(post, position=position, total_posts=len(posts))
     stamp = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     tag = "kemono-favorites-staging-" + stamp
     release_id = create_draft(tag, "Private staging for favorites " + stamp)
@@ -579,7 +579,7 @@ def assemble(staging_id, staging_tag):
          for post in posts[i * BATCH_SIZE:(i + 1) * BATCH_SIZE]}
         for i in range(batch_count)
     ]
-    summary = {"schema_version": layout.VERSION, "layout": "service/author_id/[post_id]title",
+    summary = {"schema_version": layout.VERSION, "layout": layout.LAYOUT_NAME,
                "target_union_total": len(posts), **totals, "posts_pending": 0,
                "complete": totals["missing_originals"] == 0 and totals["detail_failed"] == 0,
                "compression": "xz -9e; one tar stream; CRC64", "part_bytes_max": PART_BYTES,
@@ -623,7 +623,7 @@ def assemble(staging_id, staging_tag):
     save_json(summary_path, summary)
     upload(tag, release_id, summary_path)
     incomplete = not summary["complete"]
-    notes = ("V2 only: service/author_id/[post_id]title; media and previews are post-local.\n\n"
+    notes = ("V2 only: service/author_id/post_id_pNNNNN; media and previews are post-local.\n\n"
              + f"{'INCOMPLETE: missing originals or post details. ' if incomplete else ''}"
              f"Processed {len(posts)} favourite posts. Metadata saved: {totals['metadata_saved']}. "
              f"Original downloads: {totals['original_saved']}; previews: {totals['preview_saved']}.\n\n"

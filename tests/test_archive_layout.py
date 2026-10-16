@@ -29,26 +29,26 @@ class LayoutTests(unittest.TestCase):
         self.registry = layout.FrozenLayout()
 
     def test_three_level_paths_and_no_title(self):
-        p = self.registry.plan("fanbox", "123", "999", " hello / world ")
-        self.assertEqual(p.relative, "fanbox/123/[999]hello _ world")
-        self.assertEqual(self.registry.plan("fanbox", "123", "1000", None).relative, "fanbox/123/[1000]")
+        p = self.registry.plan("fanbox", "123", "999", " hello / world ", position=1, total_posts=1289)
+        self.assertEqual(p.relative, "fanbox/123/999_p00001")
+        self.assertEqual(self.registry.plan("fanbox", "123", "1000", None, position=2, total_posts=1289).relative, "fanbox/123/1000_p00002")
         self.assertEqual(p.member("content.html"), p.relative + "/content.html")
 
     def test_first_title_is_frozen_through_reload_and_artist_mode(self):
-        first = self.registry.favourite_post({"service":"patreon", "user":"406", "id":"987", "title":"Original"})
+        first = self.registry.favourite_post({"service":"patreon", "user":"406", "id":"987", "title":"Original"}, position=1, total_posts=1289)
         data = self.registry.to_dict()
         loaded = layout.FrozenLayout.from_dict(json.loads(json.dumps(data)))
         later = loaded.artist_post({"service":"patreon", "id":"406"},
                                    {"service":"patreon", "user":"406", "id":"987", "title":"Renamed and changed"})
         self.assertEqual(first, later)
-        self.assertEqual(first.relative, "patreon/406/[987]Original")
+        self.assertEqual(first.relative, "patreon/406/987_p00001")
 
     def test_windows_case_collisions_of_post_ids(self):
-        a = self.registry.plan("fanbox", "user", "Ab", "A")
-        b = self.registry.plan("fanbox", "user", "ab", "a")
+        a = self.registry.plan("fanbox", "user", "Ab", "A", position=1, total_posts=20)
+        b = self.registry.plan("fanbox", "user", "ab", "a", position=1, total_posts=20)
         self.assertNotEqual(layout._portable_key(a.relative),layout._portable_key(b.relative))
-        self.assertTrue(b.folder.startswith("[ab]"))
-        self.assertIn("__", b.folder)
+        self.assertEqual(a.folder, "Ab_p001")
+        self.assertEqual(b.folder, "ab_p002")
         loaded = layout.FrozenLayout.from_dict(self.registry.to_dict())
         self.assertEqual(loaded.plan("fanbox", "user", "ab", "later title"),b)
 
@@ -59,9 +59,9 @@ class LayoutTests(unittest.TestCase):
 
     def test_unicode_and_windows_filename_safety(self):
         x = self.registry.plan("fanbox","A1","B2", '  e\u0301 / < > : " \\ | ? * \u202etest.  ')
-        self.assertIn("é",x.folder)
-        self.assertNotIn("/",x.folder)
-        self.assertTrue(x.folder.endswith("test"))
+        self.assertEqual(x.folder, "B2_p01")
+        self.assertEqual(layout._clean_text(" e\u0301 "), "é")
+        self.assertNotIn("/", x.folder)
         self.assertEqual(layout._clean_text("\u200b"),"")
         with self.assertRaises(layout.LayoutError):
             self.registry.plan("fanbox","CON","1","bad")
@@ -72,7 +72,26 @@ class LayoutTests(unittest.TestCase):
         p = self.registry.plan("fantia", "A", "999", "图" * 200)
         self.assertLessEqual(len(p.folder.encode("utf-8")),layout.MAX_POST_COMPONENT_BYTES)
         self.assertLessEqual(len(p.relative.encode("utf-8")),layout.MAX_POST_RELATIVE_BYTES)
+        self.assertEqual(p.folder, "999_p01")
         self.assertEqual(p.folder, p.folder.encode("utf-8").decode("utf-8"))
+
+    def test_sequence_width_has_one_extra_zero_digit(self):
+        self.assertEqual(layout.serial_width(1), 2)
+        self.assertEqual(layout.serial_width(9), 2)
+        self.assertEqual(layout.serial_width(10), 3)
+        self.assertEqual(layout.serial_width(25), 3)
+        self.assertEqual(layout.serial_width(1289), 5)
+        self.assertEqual(layout.serial_width(10000), 6)
+        for count in (0, -1, True, "25", 1.0):
+            with self.assertRaises(layout.LayoutError):
+                layout.serial_width(count)
+
+    def test_sequence_is_frozen_even_when_total_grows(self):
+        first = self.registry.plan("fanbox", "12", "900", "First title", position=1, total_posts=25)
+        self.assertEqual(first.folder, "900_p001")
+        latest = layout.FrozenLayout.from_dict(self.registry.to_dict())
+        self.assertEqual(latest.plan("fanbox", "12", "900", "Renamed", position=15, total_posts=1289), first)
+        self.assertEqual(latest.plan("fanbox", "12", "901", "", position=26, total_posts=1289).folder, "901_p00026")
 
     def test_very_long_identifier_is_rejected(self):
         with self.assertRaises(layout.LayoutError):
@@ -114,7 +133,12 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaises(layout.LayoutError):
             layout.FrozenLayout.from_dict(legacy)
         legacy = self.registry.to_dict()
-        legacy["layout"] = "posts/service/author_id/post_id"
+        legacy["layout"] = "service/author_id/[post_id]title"
+        with self.assertRaises(layout.LayoutError):
+            layout.FrozenLayout.from_dict(legacy)
+        legacy = self.registry.to_dict()
+        legacy["posts"] = [{"service": "fanbox", "author_id": "123",
+                           "post_id": "456", "folder": "[456]Original"}]
         with self.assertRaises(layout.LayoutError):
             layout.FrozenLayout.from_dict(legacy)
         legacy = self.registry.to_dict()

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# 待确认：真实 Favourite Artists 全量帖子的标题分布、永久路径注册表的私有存储位置。
-# 歧义：首次归档时若各来源的标题不一致，以首次成功登记的标题作为冻结值；不承诺不同空白注册表独立规划结果一致。
+# 待确认：Favourite Posts与Artists任务排序是否影响首次分配的序号、永久注册表的私有存储位置。
+# 歧义：按首次任务总数确定p字段宽度；后续集合增长不重命名；不同空白注册表无法协调序号。
 # 后续研究：V2 冻结注册表完整性核验、Windows 解压路径长度与长期备份策略。
 # 潜在优化：注册表较大时按作者分片；当前先保留标准库、可复核、确定性逻辑。
-# 风险：目录名可能包含敏感标题；注册表是私有资产；不得未经授权提交到公开 Git 历史。
-# 验证重点：真实快照、Unicode、DOS 保留名、大小写冲突、路径长度、冻结后标题变化、跨来源同一帖子复用。
+# 风险：编号与任务顺序可能透露账户收藏信息；注册表不得未经授权提交到公开 Git 历史。
+# 验证重点：真实快照、按任务总数补零、DOS保留名、大小写冲突、跨来源同一帖子复用及序号冻结。
 """Shared, offline V2 path planner for favourite posts and favourite artists.
 
 This module DOES NOT download content, change a repository or write a registry by
@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Mapping, Optional, Tuple
 
 VERSION = 2
+LAYOUT_NAME = "service/author_id/post_id_p{padded_sequence}"
 MAX_TITLE_BYTES = 112
 MAX_POST_COMPONENT_BYTES = 180
 MAX_POST_RELATIVE_BYTES = 205
@@ -94,19 +95,23 @@ def _portable_key(path: str) -> str:
     return unicodedata.normalize("NFD", path).casefold()
 
 
-def _sha_suffix(parts: Tuple[str, str, str]) -> str:
-    return hashlib.sha256(json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()[:12]
+def serial_width(post_count: int) -> int:
+    """One extra leading-zero position beyond the decimal width of total posts."""
+    if isinstance(post_count, bool) or not isinstance(post_count, int) or post_count < 1:
+        raise LayoutError("post total must be a positive integer")
+    return len(str(post_count)) + 1
 
 
-def _segment(service: str, author_id: str, post_id: str, title: Optional[str], suffix: str = "") -> str:
-    prefix = f"[{post_id}]"
-    capacity = min(MAX_POST_COMPONENT_BYTES, MAX_POST_RELATIVE_BYTES - len(f"{service}/{author_id}/".encode()))
-    if len(prefix.encode()) + len(suffix.encode()) > capacity:
-        raise LayoutError("relative path budget too small for complete post id")
-    cleaned = _clean_text(title)
-    budget = min(MAX_TITLE_BYTES, capacity - len(prefix.encode()) - len(suffix.encode()))
-    cleaned = _utf8_truncate(cleaned, budget).rstrip(" ._")
-    return prefix + cleaned + suffix
+def _segment(service: str, author_id: str, post_id: str,
+             position: int, post_count: int) -> str:
+    if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+        raise LayoutError("post sequence must be a positive integer")
+    width = max(serial_width(post_count), len(str(position)) + 1)
+    value = f"{post_id}_p{position:0{width}d}"
+    budget = min(MAX_POST_COMPONENT_BYTES, MAX_POST_RELATIVE_BYTES - len(f"{service}/{author_id}/".encode()))
+    if len(value.encode("utf-8")) > budget:
+        raise LayoutError("post ID and sequence exceed path budget")
+    return value
 
 
 def _check_segment(segment: str) -> None:
@@ -195,14 +200,25 @@ class FrozenLayout:
             raise LayoutError("artist record must be an object")
         return self.author(record.get("service"), record.get("id"))
 
-    def plan(self, service: str, author_id: str, post_id: str, title: Optional[str]) -> PostPath:
+    def plan(self, service: str, author_id: str, post_id: str,
+             title: Optional[str] = None, *, position: Optional[int] = None,
+             total_posts: Optional[int] = None) -> PostPath:
         identity = _identity(service, author_id, post_id)
         self.author(service, author_id)
         existing = self._posts.get(identity)
         if existing is not None:
-            return existing  # Freeze beats a changed API title.
-        for suffix in ("", "__" + _sha_suffix(identity)):
-            folder = _segment(service, author_id, post_id, title, suffix)
+            return existing  # First assigned post sequence is frozen across both modes.
+        # The title stays in JSON and does not influence directory names.
+        if position is None:
+            position = len(self._posts) + 1
+        if total_posts is None:
+            total_posts = max(position, len(self._posts) + 1)
+        serial_width(total_posts)
+        if isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= total_posts:
+            raise LayoutError("sequence must belong to its initial post total")
+        # Case-insensitive post-ID collisions may require skipping a sequence.
+        for candidate in range(position, position + len(self._posts) + 2):
+            folder = _segment(service, author_id, post_id, candidate, total_posts)
             _check_segment(folder)
             target = PostPath(service, author_id, post_id, folder)
             key = _portable_key(target.relative)
@@ -212,12 +228,15 @@ class FrozenLayout:
                 return target
         raise LayoutError("portable post path collision cannot be resolved")
 
-    def favourite_post(self, item: Mapping[str, object]) -> PostPath:
+    def favourite_post(self, item: Mapping[str, object], *, position: Optional[int] = None,
+                       total_posts: Optional[int] = None) -> PostPath:
         if not isinstance(item, Mapping):
             raise LayoutError("post record must be an object")
-        return self.plan(item.get("service"), item.get("user"), item.get("id"), item.get("title"))
+        return self.plan(item.get("service"), item.get("user"), item.get("id"),
+                         item.get("title"), position=position, total_posts=total_posts)
 
-    def artist_post(self, artist: Mapping[str, object], item: Mapping[str, object]) -> PostPath:
+    def artist_post(self, artist: Mapping[str, object], item: Mapping[str, object],
+                    *, position: Optional[int] = None, total_posts: Optional[int] = None) -> PostPath:
         if not isinstance(artist, Mapping) or not isinstance(item, Mapping):
             raise LayoutError("artist/post must be objects")
         service, author_id, _ = _identity(artist.get("service"), artist.get("id"), "dummy")
@@ -225,10 +244,10 @@ class FrozenLayout:
         if (service, author_id) != (post_service, post_author):
             raise LayoutError("post identity differs from selected favourite artist")
         self.artist(artist)
-        return self.favourite_post(item)
+        return self.favourite_post(item, position=position, total_posts=total_posts)
 
     def to_dict(self) -> dict:
-        return {"schema_version": VERSION, "layout": "service/author_id/[post_id]title",
+        return {"schema_version": VERSION, "layout": LAYOUT_NAME,
                 "posts": [{"service": x.service, "author_id": x.author_id,
                            "post_id": x.post_id, "folder": x.folder}
                           for x in sorted(self._posts.values(), key=lambda x:(x.service,x.author_id,x.post_id))],
@@ -237,7 +256,7 @@ class FrozenLayout:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "FrozenLayout":
         if (not isinstance(data, dict) or data.get("schema_version") != VERSION
-                or data.get("layout") != "service/author_id/[post_id]title"
+                or data.get("layout") != LAYOUT_NAME
                 or not isinstance(data.get("posts"), list) or not isinstance(data.get("authors"), list)):
             raise LayoutError("invalid V2 registry")
         registry = cls()
@@ -251,7 +270,9 @@ class FrozenLayout:
                 raise LayoutError("invalid registered post")
             service, user, post_id = _identity(row.get("service"), row.get("author_id"), row.get("post_id"))
             folder = row.get("folder")
-            if not isinstance(folder, str) or not folder.startswith(f"[{post_id}]") or len(folder.encode()) > MAX_POST_COMPONENT_BYTES:
+            if (not isinstance(folder, str) or not re.fullmatch(re.escape(post_id) + r"_p0[0-9]+", folder)
+                    or int(folder.rsplit("_p", 1)[1]) < 1
+                    or len(folder.encode()) > MAX_POST_COMPONENT_BYTES):
                 raise LayoutError("invalid frozen post folder")
             _check_segment(folder)
             obj = PostPath(service, user, post_id, folder)
@@ -286,8 +307,8 @@ def inspect_zip(path: Path) -> dict:
     registry = FrozenLayout()
     for artist in artists:
         registry.artist(artist)
-    for post in posts:
-        registry.favourite_post(post)
+    for position, post in enumerate(posts, 1):
+        registry.favourite_post(post, position=position, total_posts=len(posts))
     overlap = {(x.get("service"), x.get("id")) for x in artists}
     overlap_posts = sum((p["service"], p["user"]) in overlap for p in posts)
     actual = [registry.favourite_post(p) for p in posts]
@@ -296,13 +317,9 @@ def inspect_zip(path: Path) -> dict:
     summary = {"artist_count": len(artists), "post_count": len(posts),
                "unique_paths": len({_portable_key(x.relative) for x in actual}),
                "overlap_post_count": overlap_posts,
-               "title_cleaning_count": sum(_clean_text(p.get("title")) != (p.get("title") or "") for p in posts),
-               "title_truncation_count": sum(
-                   len(_clean_text(p.get("title")).encode("utf-8")) >
-                   len(x.folder.removeprefix(f"[{x.post_id}]").encode("utf-8"))
-                   for p, x in zip(posts, actual)
-               ),
-               "fallback_no_title": sum(x.folder == f"[{x.post_id}]" for x in actual),
+               "post_sequence_width": serial_width(len(posts)) if posts else 0,
+               "post_sequence_first": actual[0].folder if actual else None,
+               "post_sequence_last": actual[-1].folder if actual else None,
                "max_post_folder_bytes": max((len(x.folder.encode()) for x in actual), default=0),
                "max_post_relative_bytes": max((len(x.relative.encode()) for x in actual), default=0),
                "media_path_smoke_test": all(len(x.media_member("/data/example/image.jpeg").encode()) <= MAX_MEMBER_RELATIVE_BYTES for x in actual)}

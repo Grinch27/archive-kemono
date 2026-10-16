@@ -3,7 +3,7 @@
 Both **Favourite Posts** and **Favourite Artists** use one archive layout:
 
 ```text
-{service}/{author_id}/[{post_id}]{sanitized_frozen_title}/
+{service}/{author_id}/{post_id}_p{zero_padded_sequence}/
   post.json
   snapshot.json       # When a favourite-post snapshot is available
   listing.json        # Optional
@@ -17,15 +17,21 @@ Both **Favourite Posts** and **Favourite Artists** use one archive layout:
 An artist archive may also contain `{service}/{author_id}/_author.json`,
 `_posts.json`, `_files.json`, and `_failed-files.json`. All tar member
 paths use POSIX separators. The identity is `(service, author_id, post_id)`;
-titles are for readability, not identification.
+the p-number is the first registered post's sequence (width = digits(total) + 1). Titles remain only in JSON.
 
 ## Format contract
 
 - **Only V2 is supported for new production archives.** No V1 archive import,
   V1 recovery, V1-to-V2 converter, or V1 media layout fallback exists.
-- The `layout-registry.json` release asset contains `schema_version: 2`
-  and frozen post folder names. Reuse a previously **published** V2 registry
-  so that the same post retains its directory even if its title changes.
+- The `layout-registry.json` release asset contains `schema_version: 2`,
+  the layout identifier, and frozen post folder names. For 1,289 posts use
+  five digits: `12345_p00001` to `67890_p01289` (example post IDs).
+  For 25 posts use three digits: `12345_p001`. The initial sequence and
+  padding are frozen across subsequent runs and both favourite modes. Adding
+  posts does not rename previously archived folders. The post title remains
+  intact in the JSON/HTML content, not the folder name.
+  Only published registries with the **new** layout identifier are reusable.
+  Previous title-based V2 registries are incompatible and are not imported.
 - A Favourite Posts staging batch manifest must contain `schema_version: 2`.
   Assembly rejects missing/older versions and rejects tar entries that are
   not inside the approved V2 post directories. The final
