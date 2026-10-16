@@ -30,9 +30,9 @@ class FavoritesTests(unittest.TestCase):
         allowed = {"fanbox/a123/p456_p001"}
         for member in (
                 "fanbox/a123/p456_p001/post.json",
-                "fanbox/a123/[p456]Title/status.json",
-                "fanbox/a123/[p456]Title/media/image__abcd.jpg",
-                "fanbox/a123/[p456]Title/previews/image__abcd.webp"):
+                "fanbox/a123/p456_p001/status.json",
+                "fanbox/a123/p456_p001/media/image__abcd.jpg",
+                "fanbox/a123/p456_p001/previews/image__abcd.webp"):
             app.require_v2_member(member, allowed)
         for member in (
                 "posts/fanbox/a123/p456/status.json",
@@ -40,8 +40,8 @@ class FavoritesTests(unittest.TestCase):
                 "previews/image.jpg",
                 "archive-summary.json",
                 "fanbox/a123/p457_p001/post.json",
-                "fanbox/a123/[p456]Title/media/deep/file.jpg",
-                "fanbox/a123/[p456]Title/future.bin"):
+                "fanbox/a123/p456_p001/media/deep/file.jpg",
+                "fanbox/a123/p456_p001/future.bin"):
             with self.subTest(member=member), self.assertRaises(ValueError):
                 app.require_v2_member(member, allowed)
 
@@ -241,7 +241,7 @@ class FavoritesTests(unittest.TestCase):
                 self.assertEqual(sum("/media/" in n for n in archive.getnames()), 3)
                 self.assertEqual(sum(n.endswith("/snapshot.json") for n in archive.getnames()), 3)
                 self.assertEqual(archive.extractfile("fanbox/fixture/0_p01/content.html").read().decode(), "合成正文")
-                self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/[0]合成标题/snapshot.json").read())
+                self.assertNotIn(b"faved_seq", archive.extractfile("fanbox/fixture/0_p01/snapshot.json").read())
             self.assertEqual(len(publications), 1)
             self.assertIn("draft=false", publications[0])
 
